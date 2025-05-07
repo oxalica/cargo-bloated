@@ -4,11 +4,15 @@ use std::collections::hash_map::Entry;
 use std::fmt;
 use std::io::{BufReader, Write};
 use std::process::{Command, Stdio};
+use std::sync::LazyLock;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::Utf8PathBuf;
-use cargo_metadata::{Message, MetadataCommand, TargetKind};
+use cargo_metadata::{Artifact, Message, MetadataCommand, TargetKind};
 use color_print::cwriteln;
+use regex_lite::Regex;
+
+use crate::analyze::{CrateName, SYSROOT_CRATES};
 
 mod analyze;
 
@@ -33,6 +37,8 @@ struct Cli {
     crates: Option<CrateGrouping>,
     #[arg(long, conflicts_with = "crates")]
     mangled: bool,
+    #[arg(long)]
+    disambig: bool,
     #[arg(long, short)]
     verbose: bool,
 
@@ -263,11 +269,11 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         tgt
     };
 
-    let mut crate_build_order = <HashMap<String, usize>>::from_iter([
-        ("core".into(), 0),
-        ("alloc".into(), 1),
-        ("std".into(), 2),
-    ]);
+    let mut crate_topo_order = SYSROOT_CRATES
+        .iter()
+        .enumerate()
+        .map(|(idx, &name)| (CrateName(name.to_owned()), idx))
+        .collect::<HashMap<CrateName, usize>>();
 
     let artifact = {
         let mut cmd = Command::new(&cargo_path);
@@ -287,27 +293,40 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         let reader = BufReader::new(child.stdout.take().unwrap());
         let mut final_artifact = None;
         for msg in Message::parse_stream(reader) {
-            if let Message::CompilerArtifact(artifact) = msg? {
-                if artifact.package_id == pkg.id && artifact.target == *target {
-                    final_artifact = Some(artifact.clone());
-                }
-                if artifact.target.is_proc_macro() || artifact.target.is_custom_build() {
+            let Message::CompilerArtifact(artifact) = msg? else {
+                continue;
+            };
+            if artifact.package_id == pkg.id && artifact.target == *target {
+                final_artifact = Some(artifact.clone());
+            }
+            if artifact.target.is_proc_macro() || artifact.target.is_custom_build() {
+                continue;
+            }
+
+            let crate_name = match get_crate_name_from_artifact(&artifact) {
+                Ok(crate_name) => crate_name,
+                Err(err) => {
+                    let _ = cwriteln!(
+                        werr,
+                        "<yellow,bold>warning</>: cannot resolve disambiguator from artifact {:?}, results may be incorrect: {}",
+                        artifact.filenames,
+                        err,
+                    );
                     continue;
                 }
+            };
 
-                let crate_name = artifact.target.name;
-                let next_idx = crate_build_order.len();
-                match crate_build_order.entry(crate_name) {
-                    Entry::Occupied(ent) => {
-                        let _ = cwriteln!(
-                            werr,
-                            "<yellow,bold>warning</>: duplicated crate names in dependency graph, results may be incorrect: {}",
-                            ent.key(),
-                        );
-                    }
-                    Entry::Vacant(ent) => {
-                        ent.insert(next_idx);
-                    }
+            let next_idx = crate_topo_order.len();
+            match crate_topo_order.entry(crate_name) {
+                Entry::Occupied(ent) => {
+                    let _ = cwriteln!(
+                        werr,
+                        "<yellow,bold>warning</>: duplicated crate names in dependency graph, results may be incorrect: {}",
+                        ent.key().0,
+                    );
+                }
+                Entry::Vacant(ent) => {
+                    ent.insert(next_idx);
                 }
             }
         }
@@ -317,6 +336,17 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         }
         final_artifact.context("artifact is not produced")?
     };
+
+    if cli.verbose {
+        let mut ordered_crates = crate_topo_order.iter().collect::<Vec<_>>();
+        ordered_crates.sort_unstable_by_key(|(_, ord)| **ord);
+        let mut out = ordered_crates
+            .iter()
+            .flat_map(|(name, _)| [name.display(true), ", "])
+            .collect::<String>();
+        out.pop();
+        let _ = cwriteln!(werr, "crates in dependency graph: {out}");
+    }
 
     let exe_path = artifact
         .executable
@@ -337,7 +367,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
     if werr.is_terminal() {
         let _ = cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}");
     }
-    let report = analyze::analyze(exe_path, &crate_build_order, &mut werr)
+    let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 
     #[rustfmt::skip]
@@ -351,12 +381,13 @@ fn main_inner(mut cli: Cli) -> Result<()> {
     };
 
     if let Some(grouping) = cli.crates {
-        let mut crate_tally = <HashMap<&str, u64>>::new();
+        let unknown_crate = CrateName("?".into());
+        let mut crate_tally = <HashMap<&CrateName, u64>>::new();
         for func in &report.funcs {
             let sym = &func.symbols[0];
             match grouping {
                 CrateGrouping::Primary => {
-                    let name = sym.primary_crate().unwrap_or("?");
+                    let name = sym.primary_crate().unwrap_or(&unknown_crate);
                     *crate_tally.entry(name).or_default() += func.size;
                 }
                 CrateGrouping::Mention => {
@@ -385,7 +416,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
                 perc(size, report.file_size),
                 perc(size, report.text_size),
                 ByteSize(size),
-                name,
+                name.display(cli.disambig),
             )?;
         }
     } else {
@@ -400,15 +431,15 @@ fn main_inner(mut cli: Cli) -> Result<()> {
                 perc(func.size, report.file_size),
                 perc(func.size, report.text_size),
                 ByteSize(func.size),
-                func.symbols[0].display_crates(),
-                func.symbols[0].display_name(cli.mangled),
+                func.symbols[0].display_crates(cli.disambig),
+                func.symbols[0].display_name(cli.mangled, cli.disambig),
             )?;
             for sym in &func.symbols[1..] {
                 cwriteln!(
                     w,
                     "<dim>                       {:32} {}</>",
-                    sym.display_crates(),
-                    sym.display_name(cli.mangled),
+                    sym.display_crates(cli.disambig),
+                    sym.display_name(cli.mangled, cli.disambig),
                 )?;
             }
         }
@@ -419,6 +450,31 @@ fn main_inner(mut cli: Cli) -> Result<()> {
 
 fn perc(x: u64, y: u64) -> f32 {
     x as f32 / y as f32 * 100.0
+}
+
+fn get_crate_name_from_artifact(artifact: &Artifact) -> Result<CrateName> {
+    static RE_DISAMBIG_HASH: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\.[[:xdigit:]]+-cgu").unwrap());
+
+    let bare_name = artifact.target.name.replace("-", "_");
+
+    let rlib_path = artifact
+        .filenames
+        .iter()
+        .find(|path| path.extension() == Some("rlib"))
+        .context("missing rlib output")?;
+    let bytes = std::fs::read(rlib_path).with_context(|| format!("failed to read {rlib_path}"))?;
+    let archive = goblin::archive::Archive::parse(&bytes)
+        .with_context(|| format!("failed to parse {rlib_path}"))?;
+    for member in archive.members() {
+        if let Some(m) = RE_DISAMBIG_HASH.find(member) {
+            let m = m.as_str();
+            let meta = &m[1..m.len() - 4];
+            return Ok(CrateName(format!("{bare_name}[{meta}]")));
+        }
+    }
+
+    bail!("cannot find disambiguator from rlib");
 }
 
 struct ByteSize(u64);

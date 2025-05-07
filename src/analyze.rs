@@ -1,6 +1,7 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
-    sync::OnceLock,
+    sync::LazyLock,
 };
 
 use anyhow::{Context, Result, bail};
@@ -8,6 +9,12 @@ use cargo_metadata::camino::Utf8Path;
 use color_print::cwriteln;
 use goblin::Object;
 use regex_lite::Regex;
+
+/// Special cases crates that does not appear in dependency graph.
+/// They are not disambiguated.
+///
+/// Defined in topological order.
+pub const SYSROOT_CRATES: &[&str] = &["core", "alloc", "std", "proc_macro", "test"];
 
 #[derive(Debug, Default)]
 pub struct Report {
@@ -30,35 +37,55 @@ pub struct Func {
 pub struct Symbol {
     pub raw_name: String,
     pub demangled_name: Option<String>,
-    pub crate_names: Option<Vec<String>>,
+    pub crate_names: Option<Vec<CrateName>>,
 }
 
 impl Symbol {
-    pub fn display_name(&self, mangled: bool) -> &str {
-        if mangled {
-            &self.raw_name
-        } else {
-            self.demangled_name.as_deref().unwrap_or(&self.raw_name)
+    pub fn display_name(&self, mangled: bool, with_disambig: bool) -> Cow<'_, str> {
+        let Some(demangled) = self.demangled_name.as_ref().filter(|_| !mangled) else {
+            return Cow::Borrowed(&self.raw_name);
+        };
+        if with_disambig {
+            return Cow::Borrowed(demangled);
         }
+        RE_DISAMBIGUATOR.replace_all(demangled, "")
     }
 
-    pub fn display_crates(&self) -> String {
+    pub fn display_crates(&self, with_disambig: bool) -> String {
         let Some(names) = &self.crate_names else {
             return "?".into();
         };
-        let mut s = names.iter().flat_map(|s| [s, ","]).collect::<String>();
+        let mut s = names
+            .iter()
+            .flat_map(|s| [s.display(with_disambig), ","])
+            .collect::<String>();
         s.pop();
         s
     }
 
-    pub fn primary_crate(&self) -> Option<&str> {
-        Some(self.crate_names.as_ref()?.first()?)
+    pub fn primary_crate(&self) -> Option<&CrateName> {
+        self.crate_names.as_ref()?.first()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CrateName(pub String);
+
+impl CrateName {
+    pub fn display(&self, with_disambig: bool) -> &str {
+        if with_disambig {
+            return &self.0;
+        }
+        match self.0.split_once('[') {
+            Some((name, _)) => name,
+            None => &self.0,
+        }
     }
 }
 
 pub fn analyze(
     exe_path: &Utf8Path,
-    crate_topo_order: &HashMap<String, usize>,
+    crate_topo_order: &HashMap<CrateName, usize>,
     werr: &mut dyn std::io::Write,
 ) -> Result<Report> {
     let mut ret = Report::default();
@@ -100,10 +127,12 @@ pub fn analyze(
         }
 
         let raw_name = elf.strtab[sym.st_name].to_owned();
-        let demangled_name = demangle_rust(&raw_name);
+        let demangled_name = rustc_demangle::try_demangle(&raw_name)
+            .ok()
+            .map(|s| s.to_string());
         let crate_names = raw_name.starts_with("_R").then_some(()).and_then(|()| {
             let demangled_name = demangled_name.as_ref()?;
-            let mut crates = find_func_crates(&demangled_name)?
+            let mut crates = find_func_crates(demangled_name)?
                 .into_iter()
                 .collect::<Vec<_>>();
             if let Some((idx, _)) = crates
@@ -112,7 +141,7 @@ pub fn analyze(
                 // Choose the latest crates in topo order, which must be the
                 // latest instantiation location. Use crate name to break the tie.
                 .max_by_key(|&(_, s)| {
-                    let order = crate_topo_order.get(s.as_str()).copied();
+                    let order = crate_topo_order.get(s).copied();
                     if order.is_none() {
                         unknown_crates.insert(s.clone());
                     }
@@ -168,7 +197,7 @@ pub fn analyze(
             .map(|(idx, sym)| {
                 let order = (|| {
                     let crates = sym.crate_names.as_ref()?;
-                    let order = *crate_topo_order.get(crates[0].as_str())?;
+                    let order = *crate_topo_order.get(&crates[0])?;
                     Some(order)
                 })()
                 .unwrap_or(!0usize);
@@ -196,17 +225,9 @@ pub fn analyze(
     Ok(ret)
 }
 
-fn demangle_rust(raw_name: &str) -> Option<String> {
-    static RE_REMOVE_DISAMBIGUATOR: OnceLock<Regex> = OnceLock::new();
-    let re = RE_REMOVE_DISAMBIGUATOR.get_or_init(|| Regex::new(r"\[[[:xdigit:]]+\]").unwrap());
-    let s = rustc_demangle::try_demangle(raw_name).ok()?.to_string();
-    let s = re.replace_all(&s, "").into_owned();
-    Some(s)
-}
-
 #[derive(Default)]
 struct CrateCollector {
-    crate_names: HashSet<String>,
+    crate_names: HashSet<CrateName>,
 }
 
 /// <https://rust-lang.github.io/rfcs/2603-rust-symbol-name-mangling-v0.html#syntax-of-mangled-names>
@@ -221,11 +242,22 @@ const BASIC_TYPES: &[&str] = &[
 ];
 
 impl CrateCollector {
-    fn visit_root_name(&mut self, name: &syn::Ident) {
-        let name = name.to_string();
-        if !BASIC_TYPES.contains(&&*name) {
-            self.crate_names.insert(name);
+    fn visit_root_name(&mut self, ident: &syn::Ident) {
+        let ident = ident.to_string();
+        if BASIC_TYPES.contains(&&*ident) {
+            return;
         }
+        let name = match ident.split_once(DISAMBIG_SEP) {
+            Some((name, disambig)) => {
+                if SYSROOT_CRATES.contains(&name) {
+                    name.into()
+                } else {
+                    format!("{name}[{disambig}]")
+                }
+            }
+            _ => ident,
+        };
+        self.crate_names.insert(CrateName(name));
     }
 }
 
@@ -249,11 +281,18 @@ impl syn::visit::Visit<'_> for CrateCollector {
     }
 }
 
-fn find_func_crates(demangled_name: &str) -> Option<HashSet<String>> {
-    static RE_SANITIZE_IDENT: OnceLock<Regex> = OnceLock::new();
+static RE_DISAMBIGUATOR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[([[:xdigit:]]+)\]").unwrap());
+static RE_SANITIZE_IDENT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{[^}]*\}|\b_\b").unwrap());
+
+const DISAMBIG_SEP: &str = "__disambig_";
+const DISAMBIG_REPLACER: &str = "__disambig_$1";
+
+fn find_func_crates(demangled_name: &str) -> Option<HashSet<CrateName>> {
     // `{closure#0}`, `{shim:vtable#0}`, `foo::_::bar`, `<foo::Foo<_>>::bar` (item inside generic item).
-    let re = RE_SANITIZE_IDENT.get_or_init(|| Regex::new(r"\{[^}]*\}|\b_\b").unwrap());
-    let s = re.replace_all(demangled_name, "__");
+    let s = RE_SANITIZE_IDENT.replace_all(demangled_name, "__");
+    let s = RE_DISAMBIGUATOR.replace_all(&s, DISAMBIG_REPLACER);
 
     let path = syn::parse_str::<syn::ExprPath>(&s).ok()?;
     let mut v = CrateCollector::default();
@@ -262,7 +301,7 @@ fn find_func_crates(demangled_name: &str) -> Option<HashSet<String>> {
     // If no crate name is found, assume it to be from `std`.
     // This happens for method functions on primitive types, eg. `<[u8]>::repeat`.
     if v.crate_names.is_empty() {
-        v.crate_names.insert("std".into());
+        v.crate_names.insert(CrateName("std".into()));
     }
     Some(v.crate_names)
 }
