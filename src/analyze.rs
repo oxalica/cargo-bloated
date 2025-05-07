@@ -195,6 +195,8 @@ const BASIC_TYPES: &[&str] = &[
     "i8", "i16", "i32", "i64", "i128", "isize",
     "u8", "u16", "u32", "u64", "u128", "usize",
     "f32", "f64",
+    // Sanitized from `_` types or names.
+    "__",
 ];
 
 impl CrateCollector {
@@ -227,8 +229,9 @@ impl syn::visit::Visit<'_> for CrateCollector {
 }
 
 fn find_func_crates(demangled_name: &str) -> Option<HashSet<String>> {
-    static RE_REMOVE_CLOSURE_SHIM: OnceLock<Regex> = OnceLock::new();
-    let re = RE_REMOVE_CLOSURE_SHIM.get_or_init(|| Regex::new(r"\{[^}]*\}").unwrap());
+    static RE_SANITIZE_IDENT: OnceLock<Regex> = OnceLock::new();
+    // `{closure#0}`, `{shim:vtable#0}`, `foo::_::bar`, `<foo::Foo<_>>::bar` (item inside generic item).
+    let re = RE_SANITIZE_IDENT.get_or_init(|| Regex::new(r"\{[^}]*\}|\b_\b").unwrap());
     let s = re.replace_all(demangled_name, "__");
 
     let path = syn::parse_str::<syn::ExprPath>(&s).ok()?;
