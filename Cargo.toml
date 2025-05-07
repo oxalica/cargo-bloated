@@ -8,4 +8,6 @@ anyhow = "1.0.98"
 cargo_metadata = "0.19.2"
 clap = { version = "4.5.37", features = ["derive"] }
 goblin = "0.9.3"
+regex-lite = "0.1.6"
 rustc-demangle = "0.1.24"
+syn = { version = "2.0.101", default-features = false, features = ["derive", "parsing", "visit"] }

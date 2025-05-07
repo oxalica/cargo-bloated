@@ -1,8 +1,12 @@
-use std::collections::HashMap;
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::OnceLock,
+};
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::Utf8Path;
 use goblin::Object;
+use regex_lite::Regex;
 
 #[derive(Debug, Default)]
 pub struct Report {
@@ -24,7 +28,23 @@ pub struct Func {
 #[derive(Debug)]
 pub struct Symbol {
     pub raw_name: String,
-    pub display_name: String,
+    pub demangled_name: Option<String>,
+    pub crate_names: Option<BTreeSet<String>>,
+}
+
+impl Symbol {
+    pub fn display_name(&self) -> &str {
+        self.demangled_name.as_deref().unwrap_or(&self.raw_name)
+    }
+
+    pub fn display_crates(&self) -> String {
+        let Some(names) = &self.crate_names else {
+            return "?".into();
+        };
+        let mut s = names.iter().flat_map(|s| [s, ","]).collect::<String>();
+        s.pop();
+        s
+    }
 }
 
 pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
@@ -67,6 +87,12 @@ pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
 
         let raw_name = elf.strtab[sym.st_name].to_owned();
         let demangled_name = demangle_rust(&raw_name);
+        let crate_names = if raw_name.starts_with("_R") {
+            demangled_name.as_ref().and_then(|s| find_func_crates(s))
+        } else {
+            // Not a Rust symbol.
+            Some(["-".into()].into())
+        };
 
         let idx = *addr_to_func_idx.entry(sym.st_value).or_insert_with(|| {
             let idx = ret.funcs.len();
@@ -77,8 +103,9 @@ pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
             idx
         });
         ret.funcs[idx].symbols.push(Symbol {
-            display_name: demangled_name.unwrap_or_else(|| raw_name.clone()),
             raw_name,
+            demangled_name,
+            crate_names,
         });
     }
 
@@ -96,18 +123,69 @@ pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
 }
 
 fn demangle_rust(raw_name: &str) -> Option<String> {
-    let mut s = &*rustc_demangle::try_demangle(raw_name).ok()?.to_string();
+    static RE_REMOVE_DISAMBIGUATOR: OnceLock<Regex> = OnceLock::new();
+    let re = RE_REMOVE_DISAMBIGUATOR.get_or_init(|| Regex::new(r"\[[[:xdigit:]]+\]").unwrap());
+    let s = rustc_demangle::try_demangle(raw_name).ok()?.to_string();
+    let s = re.replace_all(&s, "").into_owned();
+    Some(s)
+}
 
-    // Strip disambiguators in `[..]`.
-    let mut out = String::with_capacity(s.len());
-    while let Some(lpos) = s.find('[') {
-        out.push_str(&s[..lpos]);
-        s = &s[lpos..];
-        match s.find(']') {
-            Some(rpos) => s = &s[rpos + 1..],
-            None => break,
+#[derive(Default)]
+struct CrateCollector {
+    crate_names: BTreeSet<String>,
+}
+
+/// <https://rust-lang.github.io/rfcs/2603-rust-symbol-name-mangling-v0.html#syntax-of-mangled-names>
+#[rustfmt::skip]
+const BASIC_TYPES: &[&str] = &[
+    "bool", "char", "str",
+    "i8", "i16", "i32", "i64", "i128", "isize",
+    "u8", "u16", "u32", "u64", "u128", "usize",
+    "f32", "f64",
+];
+
+impl CrateCollector {
+    fn visit_root_name(&mut self, name: &syn::Ident) {
+        let name = name.to_string();
+        if !BASIC_TYPES.contains(&&*name) {
+            self.crate_names.insert(name);
         }
     }
-    out.push_str(s);
-    Some(out)
+}
+
+impl syn::visit::Visit<'_> for CrateCollector {
+    fn visit_expr_path(&mut self, i: &'_ syn::ExprPath) {
+        if i.qself.is_none() {
+            if let Some(s) = i.path.segments.first() {
+                self.visit_root_name(&s.ident);
+            }
+        }
+        syn::visit::visit_expr_path(self, i);
+    }
+
+    fn visit_type_path(&mut self, i: &'_ syn::TypePath) {
+        if i.qself.is_none() {
+            if let Some(s) = i.path.segments.first() {
+                self.visit_root_name(&s.ident);
+            }
+        }
+        syn::visit::visit_type_path(self, i);
+    }
+}
+
+fn find_func_crates(demangled_name: &str) -> Option<BTreeSet<String>> {
+    static RE_REMOVE_CLOSURE_SHIM: OnceLock<Regex> = OnceLock::new();
+    let re = RE_REMOVE_CLOSURE_SHIM.get_or_init(|| Regex::new(r"\{[^}]*\}").unwrap());
+    let s = re.replace_all(demangled_name, "__");
+
+    let path = syn::parse_str::<syn::ExprPath>(&s).ok()?;
+    let mut v = CrateCollector::default();
+    syn::visit::Visit::visit_expr_path(&mut v, &path);
+
+    // If no crate name is found, assume it to be from `std`.
+    // This happens for method functions on primitive types, eg. `<[u8]>::repeat`.
+    if v.crate_names.is_empty() {
+        v.crate_names.insert("std".into());
+    }
+    Some(v.crate_names)
 }

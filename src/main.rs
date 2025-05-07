@@ -274,17 +274,22 @@ fn main() -> Result<()> {
         println!();
     };
 
-    println!("  File  .text    Size  Name");
+    println!("  File  .text    Size  Crates                        Name");
     for func in &report.funcs {
         println!(
-            "{:>5.1}% {:>5.1}% {}  {}",
+            "{:>5.1}% {:>5.1}% {}  {:32} {}",
             func.size as f32 / report.file_size as f32 * 100.0,
             func.size as f32 / report.text_size as f32 * 100.0,
             ByteSize(func.size),
-            func.symbols[0].display_name,
+            func.symbols[0].display_crates(),
+            func.symbols[0].display_name(),
         );
         for sym in &func.symbols[1..] {
-            println!("                       {}", sym.display_name);
+            println!(
+                "                       {:32} {}",
+                sym.display_crates(),
+                sym.display_name()
+            );
         }
     }
 

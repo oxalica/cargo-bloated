@@ -75,7 +75,9 @@ dependencies = [
  "cargo_metadata",
  "clap",
  "goblin",
+ "regex-lite",
  "rustc-demangle",
+ "syn",
 ]
 
 [[package]]
@@ -217,6 +219,12 @@ checksum = "1885c039570dc00dcb4ff087a89e185fd56bae234ddc7f056a945bf36467248d"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "regex-lite"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "53a49587ad06b26609c52e423de037e7f57f20d53535d66e08c695f347df952a"
 
 [[package]]
 name = "rustc-demangle"
