@@ -1,8 +1,8 @@
+use std::fmt;
 use std::io::BufReader;
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
-use bytesize::ByteSize;
 use cargo_metadata::camino::Utf8PathBuf;
 use cargo_metadata::{Message, MetadataCommand, TargetKind};
 
@@ -266,18 +266,18 @@ fn main() -> Result<()> {
 
     #[rustfmt::skip]
     {
-        println!("File size: {:>10}", ByteSize(report.file_size));
-        println!("    .text: {:>10} {:>5.1}%", ByteSize(report.text_size), perc(report.text_size, report.file_size));
-        println!("  .rodata: {:>10} {:>5.1}%", ByteSize(report.rodata_size), perc(report.rodata_size, report.file_size));
-        println!("    .data: {:>10} {:>5.1}%", ByteSize(report.data_size), perc(report.data_size, report.file_size));
-        println!("     .bss: {:>10} {:>5.1}%", ByteSize(report.bss_size), perc(report.bss_size, report.file_size));
+        println!("File size: {}", ByteSize(report.file_size));
+        println!("    .text: {} {:>5.1}%", ByteSize(report.text_size), perc(report.text_size, report.file_size));
+        println!("  .rodata: {} {:>5.1}%", ByteSize(report.rodata_size), perc(report.rodata_size, report.file_size));
+        println!("    .data: {} {:>5.1}%", ByteSize(report.data_size), perc(report.data_size, report.file_size));
+        println!("     .bss: {} {:>5.1}%", ByteSize(report.bss_size), perc(report.bss_size, report.file_size));
         println!();
     };
 
-    println!("  File  .text       Size Name");
+    println!("  File  .text    Size  Name");
     for func in &report.funcs {
         println!(
-            "{:>5.1}% {:>5.1}% {:>10} {}",
+            "{:>5.1}% {:>5.1}% {}  {}",
             func.size as f32 / report.file_size as f32 * 100.0,
             func.size as f32 / report.text_size as f32 * 100.0,
             ByteSize(func.size),
@@ -286,4 +286,34 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+struct ByteSize(u64);
+
+impl fmt::Display for ByteSize {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let x = self.0;
+        if x < (2 << 10) {
+            return write!(f, "{x:>4}  B");
+        }
+        let (y, unit) = if x < (2 << 20) {
+            (x as f32 / (1 << 10) as f32, "KiB")
+        } else if x < (2 << 30) {
+            (x as f32 / (1 << 20) as f32, "MiB")
+        } else {
+            (x as f32 / (1 << 30) as f32, "GiB")
+        };
+        // 1.23KiB
+        // 12.3KiB
+        //  123KiB
+        // 1234KiB
+        let prec = if y < 10.0 {
+            2
+        } else if y < 100.0 {
+            1
+        } else {
+            0
+        };
+        write!(f, "{y:>4.prec$}{unit}")
+    }
 }
