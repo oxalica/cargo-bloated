@@ -5,6 +5,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::Utf8Path;
+use color_print::cwriteln;
 use goblin::Object;
 use regex_lite::Regex;
 
@@ -55,7 +56,11 @@ impl Symbol {
     }
 }
 
-pub fn analyze(exe_path: &Utf8Path, crate_topo_order: &HashMap<&str, usize>) -> Result<Report> {
+pub fn analyze(
+    exe_path: &Utf8Path,
+    crate_topo_order: &HashMap<&str, usize>,
+    werr: &mut dyn std::io::Write,
+) -> Result<Report> {
     let mut ret = Report::default();
 
     let bytes = std::fs::read(exe_path).context("failed to read file")?;
@@ -84,6 +89,7 @@ pub fn analyze(exe_path: &Utf8Path, crate_topo_order: &HashMap<&str, usize>) -> 
     }
 
     let mut addr_to_func_idx = HashMap::new();
+    let mut unknown_crates = HashSet::new();
 
     for sym in &elf.syms {
         if !sym.is_function() || sym.st_value == 0 || sym.st_size == 0 {
@@ -95,25 +101,30 @@ pub fn analyze(exe_path: &Utf8Path, crate_topo_order: &HashMap<&str, usize>) -> 
 
         let raw_name = elf.strtab[sym.st_name].to_owned();
         let demangled_name = demangle_rust(&raw_name);
-        let crate_names = if raw_name.starts_with("_R") {
-            demangled_name.as_ref().and_then(|s| {
-                let mut crates = find_func_crates(s)?.into_iter().collect::<Vec<_>>();
-                if let Some((idx, _)) = crates
-                    .iter()
-                    .enumerate()
-                    // Choose the latest crates in topo order, which must be the
-                    // latest instantiation location. Use crate name to break the tie.
-                    .max_by_key(|(_, s)| (crate_topo_order.get(s.as_str()), *s))
-                {
-                    crates.swap(0, idx);
-                    crates[1..].sort_unstable();
-                }
-                Some(crates)
-            })
-        } else {
-            // Not a Rust symbol.
-            Some(["-".into()].into())
-        };
+        let crate_names = raw_name.starts_with("_R").then_some(()).and_then(|()| {
+            let demangled_name = demangled_name.as_ref()?;
+            let mut crates = find_func_crates(&demangled_name)?
+                .into_iter()
+                .collect::<Vec<_>>();
+            if let Some((idx, _)) = crates
+                .iter()
+                .enumerate()
+                // Choose the latest crates in topo order, which must be the
+                // latest instantiation location. Use crate name to break the tie.
+                .max_by_key(|&(_, s)| {
+                    let order = crate_topo_order.get(s.as_str()).copied();
+                    if order.is_none() {
+                        unknown_crates.insert(s.clone());
+                    }
+                    // Default to max order for unknown crates, assuming they are user crates.
+                    (order.unwrap_or(!0usize), s)
+                })
+            {
+                crates.swap(0, idx);
+                crates[1..].sort_unstable();
+            }
+            Some(crates)
+        });
 
         let idx = *addr_to_func_idx.entry(sym.st_value).or_insert_with(|| {
             let idx = ret.funcs.len();
@@ -128,6 +139,16 @@ pub fn analyze(exe_path: &Utf8Path, crate_topo_order: &HashMap<&str, usize>) -> 
             demangled_name,
             crate_names,
         });
+    }
+
+    if !unknown_crates.is_empty() {
+        let mut unknown_crates = unknown_crates.into_iter().collect::<Vec<_>>();
+        unknown_crates.sort_unstable();
+        let _ = cwriteln!(
+            werr,
+            "<yellow,bold>warning</>: cannot locate dependencies of some crates, results may be incorrect: {:?}",
+            unknown_crates,
+        );
     }
 
     for f in &mut ret.funcs {
