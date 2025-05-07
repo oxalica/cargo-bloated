@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
@@ -18,8 +19,18 @@ enum CargoCli {
     Bloated(Cli),
 }
 
+#[derive(Debug, Default, Clone, clap::ValueEnum)]
+enum CrateGrouping {
+    #[default]
+    Primary,
+    Mention,
+}
+
 #[derive(Debug, clap::Args)]
 struct Cli {
+    #[arg(long, num_args(0..=1), require_equals = true, default_missing_value = "primary")]
+    crates: Option<CrateGrouping>,
+
     #[command(flatten)]
     target: Target,
     #[arg(long, default_value = "release")]
@@ -213,7 +224,7 @@ fn main() -> Result<()> {
         tgt
     };
 
-    let mut crate_build_order = HashMap::new();
+    let mut crate_build_order = HashMap::from_iter([("core", 0), ("alloc", 1), ("std", 2)]);
 
     let artifact = {
         let mut cmd = Command::new("cargo");
@@ -274,8 +285,6 @@ fn main() -> Result<()> {
     let report = analyze::analyze(exe_path, &crate_build_order)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 
-    let perc = |x: u64, y: u64| x as f32 / y as f32 * 100.0;
-
     #[rustfmt::skip]
     {
         println!("File size: {}", ByteSize(report.file_size));
@@ -286,26 +295,68 @@ fn main() -> Result<()> {
         println!();
     };
 
-    println!("  File  .text    Size  Crates                        Name");
-    for func in &report.funcs {
+    if let Some(grouping) = cli.crates {
+        let mut crate_tally = <HashMap<&str, u64>>::new();
+        for func in &report.funcs {
+            let sym = &func.symbols[0];
+            match grouping {
+                CrateGrouping::Primary => {
+                    let name = sym.primary_crate().unwrap_or("?");
+                    *crate_tally.entry(name).or_default() += func.size;
+                }
+                CrateGrouping::Mention => {
+                    for name in sym.crate_names.iter().flatten() {
+                        *crate_tally.entry(name).or_default() += func.size;
+                    }
+                }
+            }
+        }
+        let mut crate_tally = crate_tally.into_iter().collect::<Vec<_>>();
+        crate_tally.sort_unstable_by_key(|&(name, size)| (Reverse(size), name));
+        let sum = crate_tally.iter().map(|(_, size)| size).sum::<u64>();
+
+        println!("  File  .text    Size  Crate");
         println!(
-            "{:>5.1}% {:>5.1}% {}  {:32} {}",
-            func.size as f32 / report.file_size as f32 * 100.0,
-            func.size as f32 / report.text_size as f32 * 100.0,
-            ByteSize(func.size),
-            func.symbols[0].display_crates(),
-            func.symbols[0].display_name(),
+            "{:>5.1}% {:>5.1}% {}  *",
+            perc(sum, report.file_size),
+            perc(sum, report.text_size),
+            ByteSize(sum),
         );
-        for sym in &func.symbols[1..] {
+        for (name, size) in crate_tally {
             println!(
-                "                       {:32} {}",
-                sym.display_crates(),
-                sym.display_name()
+                "{:>5.1}% {:>5.1}% {}  {}",
+                perc(size, report.file_size),
+                perc(size, report.text_size),
+                ByteSize(size),
+                name,
             );
+        }
+    } else {
+        println!("  File  .text    Size  Crates                        Name");
+        for func in &report.funcs {
+            println!(
+                "{:>5.1}% {:>5.1}% {}  {:32} {}",
+                perc(func.size, report.file_size),
+                perc(func.size, report.text_size),
+                ByteSize(func.size),
+                func.symbols[0].display_crates(),
+                func.symbols[0].display_name(),
+            );
+            for sym in &func.symbols[1..] {
+                println!(
+                    "                       {:32} {}",
+                    sym.display_crates(),
+                    sym.display_name()
+                );
+            }
         }
     }
 
     Ok(())
+}
+
+fn perc(x: u64, y: u64) -> f32 {
+    x as f32 / y as f32 * 100.0
 }
 
 struct ByteSize(u64);

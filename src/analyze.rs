@@ -45,6 +45,10 @@ impl Symbol {
         s.pop();
         s
     }
+
+    pub fn primary_crate(&self) -> Option<&str> {
+        Some(self.crate_names.as_ref()?.first()?)
+    }
 }
 
 pub fn analyze(exe_path: &Utf8Path, crate_topo_order: &HashMap<&str, usize>) -> Result<Report> {
@@ -94,8 +98,8 @@ pub fn analyze(exe_path: &Utf8Path, crate_topo_order: &HashMap<&str, usize>) -> 
                     .iter()
                     .enumerate()
                     // Choose the latest crates in topo order, which must be the
-                    // latest instantiation location.
-                    .max_by_key(|(_, s)| crate_topo_order.get(s.as_str()))
+                    // latest instantiation location. Use crate name to break the tie.
+                    .max_by_key(|(_, s)| (crate_topo_order.get(s.as_str()), *s))
                 {
                     crates.swap(0, idx);
                     crates[1..].sort_unstable();
@@ -123,8 +127,40 @@ pub fn analyze(exe_path: &Utf8Path, crate_topo_order: &HashMap<&str, usize>) -> 
     }
 
     for f in &mut ret.funcs {
-        f.symbols
-            .sort_unstable_by(|lhs, rhs| Ord::cmp(&lhs.raw_name, &rhs.raw_name));
+        // Try to select a good representative symbol name, with its
+        // max-topo-order (primary crate) being the minimum (earliest) among all
+        // other aliases.
+        //
+        // Eg.
+        // - `core::mem::drop_in_place::<std::string::String>` primary = std
+        // - `core::mem::drop_in_place::<my_crate::StringLike>` primary = my_crate
+        // Here the second function is "zero-cost" because it's already
+        // instantiated by its dependency.
+        let sort_range = if let Some((idx, _)) = f
+            .symbols
+            .iter()
+            .enumerate()
+            .map(|(idx, sym)| {
+                let order = (|| {
+                    let crates = sym.crate_names.as_ref()?;
+                    let order = *crate_topo_order.get(crates[0].as_str())?;
+                    Some(order)
+                })()
+                .unwrap_or(!0usize);
+                (idx, order)
+            })
+            .min_by_key(|(_, order)| *order)
+            // If all candidates are "bad", do not promote anyone.
+            // Just sort alphabetically.
+            .filter(|(_, order)| *order != !0usize)
+        {
+            f.symbols.swap(0, idx);
+            &mut f.symbols[1..]
+        } else {
+            &mut f.symbols
+        };
+
+        sort_range.sort_unstable_by(|lhs, rhs| Ord::cmp(&lhs.raw_name, &rhs.raw_name));
     }
 
     ret.funcs.sort_unstable_by(|lhs, rhs| {
