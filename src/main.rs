@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt;
 use std::io::BufReader;
 use std::process::{Command, Stdio};
@@ -211,6 +213,8 @@ fn main() -> Result<()> {
         tgt
     };
 
+    let mut crate_build_order = HashMap::new();
+
     let artifact = {
         let mut cmd = Command::new("cargo");
         cmd.args(["build", "--message-format=json-render-diagnostics"])
@@ -226,13 +230,21 @@ fn main() -> Result<()> {
         let reader = BufReader::new(child.stdout.take().unwrap());
         let mut final_artifact = None;
         for msg in Message::parse_stream(reader) {
-            match msg? {
-                Message::CompilerArtifact(artifact)
-                    if artifact.package_id == pkg.id && artifact.target == *target =>
-                {
+            if let Message::CompilerArtifact(artifact) = msg? {
+                let pkg_name = &*cargo_meta[&artifact.package_id].name;
+                let next_idx = crate_build_order.len();
+                match crate_build_order.entry(pkg_name) {
+                    Entry::Occupied(_) => {
+                        // bail!("TODO: duplicated crate name in dependency graph");
+                    }
+                    Entry::Vacant(ent) => {
+                        ent.insert(next_idx);
+                    }
+                }
+
+                if artifact.package_id == pkg.id && artifact.target == *target {
                     final_artifact = Some(artifact);
                 }
-                _ => {}
             }
         }
         let st = child.wait().context("failed to wait `cargo build`")?;
@@ -259,7 +271,7 @@ fn main() -> Result<()> {
         })?;
 
     eprintln!("   Analyzing {exe_path}");
-    let report = analyze::analyze(exe_path)
+    let report = analyze::analyze(exe_path, &crate_build_order)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 
     let perc = |x: u64, y: u64| x as f32 / y as f32 * 100.0;

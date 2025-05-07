@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{HashMap, HashSet},
     sync::OnceLock,
 };
 
@@ -29,7 +29,7 @@ pub struct Func {
 pub struct Symbol {
     pub raw_name: String,
     pub demangled_name: Option<String>,
-    pub crate_names: Option<BTreeSet<String>>,
+    pub crate_names: Option<Vec<String>>,
 }
 
 impl Symbol {
@@ -47,7 +47,7 @@ impl Symbol {
     }
 }
 
-pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
+pub fn analyze(exe_path: &Utf8Path, crate_topo_order: &HashMap<&str, usize>) -> Result<Report> {
     let mut ret = Report::default();
 
     let bytes = std::fs::read(exe_path).context("failed to read file")?;
@@ -88,7 +88,20 @@ pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
         let raw_name = elf.strtab[sym.st_name].to_owned();
         let demangled_name = demangle_rust(&raw_name);
         let crate_names = if raw_name.starts_with("_R") {
-            demangled_name.as_ref().and_then(|s| find_func_crates(s))
+            demangled_name.as_ref().and_then(|s| {
+                let mut crates = find_func_crates(s)?.into_iter().collect::<Vec<_>>();
+                if let Some((idx, _)) = crates
+                    .iter()
+                    .enumerate()
+                    // Choose the latest crates in topo order, which must be the
+                    // latest instantiation location.
+                    .max_by_key(|(_, s)| crate_topo_order.get(s.as_str()))
+                {
+                    crates.swap(0, idx);
+                    crates[1..].sort_unstable();
+                }
+                Some(crates)
+            })
         } else {
             // Not a Rust symbol.
             Some(["-".into()].into())
@@ -132,7 +145,7 @@ fn demangle_rust(raw_name: &str) -> Option<String> {
 
 #[derive(Default)]
 struct CrateCollector {
-    crate_names: BTreeSet<String>,
+    crate_names: HashSet<String>,
 }
 
 /// <https://rust-lang.github.io/rfcs/2603-rust-symbol-name-mangling-v0.html#syntax-of-mangled-names>
@@ -173,7 +186,7 @@ impl syn::visit::Visit<'_> for CrateCollector {
     }
 }
 
-fn find_func_crates(demangled_name: &str) -> Option<BTreeSet<String>> {
+fn find_func_crates(demangled_name: &str) -> Option<HashSet<String>> {
     static RE_REMOVE_CLOSURE_SHIM: OnceLock<Regex> = OnceLock::new();
     let re = RE_REMOVE_CLOSURE_SHIM.get_or_init(|| Regex::new(r"\{[^}]*\}").unwrap());
     let s = re.replace_all(demangled_name, "__");
