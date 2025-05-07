@@ -58,7 +58,7 @@ impl Symbol {
 
 pub fn analyze(
     exe_path: &Utf8Path,
-    crate_topo_order: &HashMap<&str, usize>,
+    crate_topo_order: &HashMap<String, usize>,
     werr: &mut dyn std::io::Write,
 ) -> Result<Report> {
     let mut ret = Report::default();

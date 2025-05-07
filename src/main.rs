@@ -263,7 +263,11 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         tgt
     };
 
-    let mut crate_build_order = HashMap::from_iter([("core", 0), ("alloc", 1), ("std", 2)]);
+    let mut crate_build_order = <HashMap<String, usize>>::from_iter([
+        ("core".into(), 0),
+        ("alloc".into(), 1),
+        ("std".into(), 2),
+    ]);
 
     let artifact = {
         let mut cmd = Command::new(&cargo_path);
@@ -284,19 +288,26 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         let mut final_artifact = None;
         for msg in Message::parse_stream(reader) {
             if let Message::CompilerArtifact(artifact) = msg? {
-                let pkg_name = &*cargo_meta[&artifact.package_id].name;
+                if artifact.package_id == pkg.id && artifact.target == *target {
+                    final_artifact = Some(artifact.clone());
+                }
+                if artifact.target.is_proc_macro() || artifact.target.is_custom_build() {
+                    continue;
+                }
+
+                let crate_name = artifact.target.name;
                 let next_idx = crate_build_order.len();
-                match crate_build_order.entry(pkg_name) {
-                    Entry::Occupied(_) => {
-                        // bail!("TODO: duplicated crate name in dependency graph");
+                match crate_build_order.entry(crate_name) {
+                    Entry::Occupied(ent) => {
+                        let _ = cwriteln!(
+                            werr,
+                            "<yellow,bold>warning</>: duplicated crate names in dependency graph, results may be incorrect: {}",
+                            ent.key(),
+                        );
                     }
                     Entry::Vacant(ent) => {
                         ent.insert(next_idx);
                     }
-                }
-
-                if artifact.package_id == pkg.id && artifact.target == *target {
-                    final_artifact = Some(artifact);
                 }
             }
         }
