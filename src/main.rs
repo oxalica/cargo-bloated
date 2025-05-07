@@ -2,12 +2,13 @@ use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::Utf8PathBuf;
 use cargo_metadata::{Message, MetadataCommand, TargetKind};
+use color_print::cwriteln;
 
 mod analyze;
 
@@ -32,6 +33,9 @@ struct Cli {
     crates: Option<CrateGrouping>,
     #[arg(long, conflicts_with = "crates")]
     mangled: bool,
+
+    #[arg(long, default_value_t = clap::ColorChoice::Auto)]
+    color: clap::ColorChoice,
 
     #[command(flatten)]
     target: Target,
@@ -93,6 +97,14 @@ impl Target {
 }
 
 impl Cli {
+    fn color(&self) -> anstream::ColorChoice {
+        match self.color {
+            clap::ColorChoice::Auto => anstream::ColorChoice::Auto,
+            clap::ColorChoice::Always => anstream::ColorChoice::Always,
+            clap::ColorChoice::Never => anstream::ColorChoice::Never,
+        }
+    }
+
     fn extend_cargo_build_args(&self, cmd: &mut Command) {
         if self.target.lib {
             // FIXME: This should also recognize dylib and staticlib.
@@ -121,7 +133,9 @@ impl Cli {
     }
 
     fn extend_cargo_metadata_args(&self, cmd: &mut Command) {
-        cmd.args(self.no_default_features.then_some("--no-default-features"))
+        cmd.arg("--color")
+            .arg(self.color.to_string())
+            .args(self.no_default_features.then_some("--no-default-features"))
             .args(self.all_features.then_some("--all-features"))
             .args(self.locked.then_some("--locked"))
             .args(self.offline.then_some("--offline"))
@@ -136,9 +150,28 @@ impl Cli {
 }
 
 fn main() -> Result<()> {
-    let CargoCli::Bloated(mut cli) = <CargoCli as clap::Parser>::parse();
+    let CargoCli::Bloated(cli) = <CargoCli as clap::Parser>::parse();
+    match main_inner(cli) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            // Exit without additional message on broken pipe. This is a common
+            // case when piping our output to a `PAGER`.
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe)
+            {
+                std::process::exit(1);
+            }
+            Err(err)
+        }
+    }
+}
 
+fn main_inner(mut cli: Cli) -> Result<()> {
     let cargo_path = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let mut w = anstream::AutoStream::new(std::io::stdout(), cli.color()).lock();
+    // Stderr is not performance critical. Do not lock to ease debugging experience.
+    let mut werr = anstream::AutoStream::new(std::io::stderr(), cli.color());
 
     let cargo_meta = {
         let mut cmd = MetadataCommand::new()
@@ -283,18 +316,20 @@ fn main() -> Result<()> {
             )
         })?;
 
-    eprintln!("   Analyzing {exe_path}");
+    if werr.is_terminal() {
+        cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}")?;
+    }
     let report = analyze::analyze(exe_path, &crate_build_order)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 
     #[rustfmt::skip]
     {
-        println!("File size: {}", ByteSize(report.file_size));
-        println!("    .text: {} {:>5.1}%", ByteSize(report.text_size), perc(report.text_size, report.file_size));
-        println!("  .rodata: {} {:>5.1}%", ByteSize(report.rodata_size), perc(report.rodata_size, report.file_size));
-        println!("    .data: {} {:>5.1}%", ByteSize(report.data_size), perc(report.data_size, report.file_size));
-        println!("     .bss: {} {:>5.1}%", ByteSize(report.bss_size), perc(report.bss_size, report.file_size));
-        println!();
+        writeln!(w, "File size: {}", ByteSize(report.file_size))?;
+        writeln!(w, "    .text: {} {:>5.1}%", ByteSize(report.text_size), perc(report.text_size, report.file_size))?;
+        writeln!(w, "  .rodata: {} {:>5.1}%", ByteSize(report.rodata_size), perc(report.rodata_size, report.file_size))?;
+        writeln!(w, "    .data: {} {:>5.1}%", ByteSize(report.data_size), perc(report.data_size, report.file_size))?;
+        writeln!(w, "     .bss: {} {:>5.1}%", ByteSize(report.bss_size), perc(report.bss_size, report.file_size))?;
+        writeln!(w)?;
     };
 
     if let Some(grouping) = cli.crates {
@@ -317,39 +352,46 @@ fn main() -> Result<()> {
         crate_tally.sort_unstable_by_key(|&(name, size)| (Reverse(size), name));
         let sum = crate_tally.iter().map(|(_, size)| size).sum::<u64>();
 
-        println!("  File  .text    Size  Crate");
-        println!(
-            "{:>5.1}% {:>5.1}% {}  *",
+        cwriteln!(w, "<underline,bold>  File  .text    Size  Crate</>")?;
+        cwriteln!(
+            w,
+            "<dim>{:>5.1}% {:>5.1}% {}  *</>",
             perc(sum, report.file_size),
             perc(sum, report.text_size),
             ByteSize(sum),
-        );
+        )?;
         for (name, size) in crate_tally {
-            println!(
+            writeln!(
+                w,
                 "{:>5.1}% {:>5.1}% {}  {}",
                 perc(size, report.file_size),
                 perc(size, report.text_size),
                 ByteSize(size),
                 name,
-            );
+            )?;
         }
     } else {
-        println!("  File  .text    Size  Crates                        Name");
+        cwriteln!(
+            w,
+            "<underline,bold>  File  .text    Size  Crates                           Name</>"
+        )?;
         for func in &report.funcs {
-            println!(
+            writeln!(
+                w,
                 "{:>5.1}% {:>5.1}% {}  {:32} {}",
                 perc(func.size, report.file_size),
                 perc(func.size, report.text_size),
                 ByteSize(func.size),
                 func.symbols[0].display_crates(),
                 func.symbols[0].display_name(cli.mangled),
-            );
+            )?;
             for sym in &func.symbols[1..] {
-                println!(
-                    "                       {:32} {}",
+                cwriteln!(
+                    w,
+                    "<dim>                       {:32} {}</>",
                     sym.display_crates(),
                     sym.display_name(cli.mangled),
-                );
+                )?;
             }
         }
     }
