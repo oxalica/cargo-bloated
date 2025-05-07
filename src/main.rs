@@ -33,6 +33,8 @@ struct Cli {
     crates: Option<CrateGrouping>,
     #[arg(long, conflicts_with = "crates")]
     mangled: bool,
+    #[arg(long, short)]
+    verbose: bool,
 
     #[arg(long, default_value_t = clap::ColorChoice::Auto)]
     color: clap::ColorChoice,
@@ -178,12 +180,14 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             .cargo_path(&cargo_path)
             .cargo_command();
         cli.extend_cargo_metadata_args(&mut cmd);
-        let output = cmd
-            .stdin(Stdio::inherit())
+        cmd.stdin(Stdio::inherit())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .output()
-            .context("failed to run `cargo metadata`")?;
+            .stderr(Stdio::inherit());
+
+        if cli.verbose {
+            let _ = cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd);
+        }
+        let output = cmd.output().context("failed to run `cargo metadata`")?;
         if !output.status.success() {
             std::process::exit(output.status.code().unwrap_or(1));
         }
@@ -262,7 +266,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
     let mut crate_build_order = HashMap::from_iter([("core", 0), ("alloc", 1), ("std", 2)]);
 
     let artifact = {
-        let mut cmd = Command::new("cargo");
+        let mut cmd = Command::new(&cargo_path);
         cmd.args(["build", "--message-format=json-render-diagnostics"])
             // FIXME: Encode, inherit.
             .env("RUSTFLAGS", "-Cprefer-dynamic -Csymbol-mangling-version=v0")
@@ -271,6 +275,9 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             .stderr(Stdio::inherit())
             .stdout(Stdio::piped());
         cli.extend_cargo_build_args(&mut cmd);
+        if cli.verbose {
+            let _ = cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd);
+        }
         let mut child = cmd.spawn().context("failed to run `cargo build`")?;
 
         let reader = BufReader::new(child.stdout.take().unwrap());
@@ -317,7 +324,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         })?;
 
     if werr.is_terminal() {
-        cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}")?;
+        let _ = cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}");
     }
     let report = analyze::analyze(exe_path, &crate_build_order)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
