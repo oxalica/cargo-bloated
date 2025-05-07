@@ -30,6 +30,8 @@ enum CrateGrouping {
 struct Cli {
     #[arg(long, num_args(0..=1), require_equals = true, default_missing_value = "primary")]
     crates: Option<CrateGrouping>,
+    #[arg(long, conflicts_with = "crates")]
+    mangled: bool,
 
     #[command(flatten)]
     target: Target,
@@ -340,13 +342,13 @@ fn main() -> Result<()> {
                 perc(func.size, report.text_size),
                 ByteSize(func.size),
                 func.symbols[0].display_crates(),
-                func.symbols[0].display_name(),
+                func.symbols[0].display_name(cli.mangled),
             );
             for sym in &func.symbols[1..] {
                 println!(
                     "                       {:32} {}",
                     sym.display_crates(),
-                    sym.display_name()
+                    sym.display_name(cli.mangled),
                 );
             }
         }

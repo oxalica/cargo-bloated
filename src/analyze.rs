@@ -33,8 +33,12 @@ pub struct Symbol {
 }
 
 impl Symbol {
-    pub fn display_name(&self) -> &str {
-        self.demangled_name.as_deref().unwrap_or(&self.raw_name)
+    pub fn display_name(&self, mangled: bool) -> &str {
+        if mangled {
+            &self.raw_name
+        } else {
+            self.demangled_name.as_deref().unwrap_or(&self.raw_name)
+        }
     }
 
     pub fn display_crates(&self) -> String {
