@@ -281,8 +281,11 @@ fn main() -> Result<()> {
             func.size as f32 / report.file_size as f32 * 100.0,
             func.size as f32 / report.text_size as f32 * 100.0,
             ByteSize(func.size),
-            func.demangled_name.as_deref().unwrap_or(&func.raw_name),
+            func.symbols[0].display_name,
         );
+        for sym in &func.symbols[1..] {
+            println!("                       {}", sym.display_name);
+        }
     }
 
     Ok(())

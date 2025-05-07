@@ -1,4 +1,4 @@
-use std::cmp::Reverse;
+use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::Utf8Path;
@@ -17,9 +17,14 @@ pub struct Report {
 
 #[derive(Debug)]
 pub struct Func {
-    pub raw_name: String,
-    pub demangled_name: Option<String>,
+    pub symbols: Vec<Symbol>,
     pub size: u64,
+}
+
+#[derive(Debug)]
+pub struct Symbol {
+    pub raw_name: String,
+    pub display_name: String,
 }
 
 pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
@@ -50,6 +55,8 @@ pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
         }
     }
 
+    let mut addr_to_func_idx = HashMap::new();
+
     for sym in &elf.syms {
         if !sym.is_function() || sym.st_value == 0 || sym.st_size == 0 {
             continue;
@@ -60,14 +67,30 @@ pub fn analyze(exe_path: &Utf8Path) -> Result<Report> {
 
         let raw_name = elf.strtab[sym.st_name].to_owned();
         let demangled_name = demangle_rust(&raw_name);
-        ret.funcs.push(Func {
+
+        let idx = *addr_to_func_idx.entry(sym.st_value).or_insert_with(|| {
+            let idx = ret.funcs.len();
+            ret.funcs.push(Func {
+                symbols: Vec::new(),
+                size: sym.st_size,
+            });
+            idx
+        });
+        ret.funcs[idx].symbols.push(Symbol {
+            display_name: demangled_name.unwrap_or_else(|| raw_name.clone()),
             raw_name,
-            demangled_name,
-            size: sym.st_size,
         });
     }
 
-    ret.funcs.sort_by_key(|sym| Reverse(sym.size));
+    for f in &mut ret.funcs {
+        f.symbols
+            .sort_unstable_by(|lhs, rhs| Ord::cmp(&lhs.raw_name, &rhs.raw_name));
+    }
+
+    ret.funcs.sort_unstable_by(|lhs, rhs| {
+        Ord::cmp(&rhs.size, &lhs.size)
+            .then_with(|| Ord::cmp(&lhs.symbols[0].raw_name, &rhs.symbols[0].raw_name))
+    });
 
     Ok(ret)
 }
