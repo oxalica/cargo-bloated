@@ -364,9 +364,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             )
         })?;
 
-    if werr.is_terminal() {
-        let _ = cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}");
-    }
+    let _ = cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}");
     let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 

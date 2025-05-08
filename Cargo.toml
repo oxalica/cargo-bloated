@@ -17,3 +17,4 @@ syn = { version = "2.0.101", default-features = false, features = ["derive", "pa
 [lints.clippy]
 # Use ANSI-aware failable write instead.
 print_stdout = "warn"
+print_stderr = "warn"
