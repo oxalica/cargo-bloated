@@ -296,7 +296,8 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             let Message::CompilerArtifact(artifact) = msg? else {
                 continue;
             };
-            if artifact.package_id == pkg.id && artifact.target == *target {
+            let is_target_crate = artifact.package_id == pkg.id && artifact.target == *target;
+            if is_target_crate {
                 final_artifact = Some(artifact.clone());
             }
             if artifact.target.is_proc_macro() || artifact.target.is_custom_build() {
@@ -306,13 +307,15 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             let crate_name = match get_crate_name_from_artifact(&artifact) {
                 Ok(crate_name) => crate_name,
                 Err(err) => {
-                    let _ = cwriteln!(
-                        werr,
-                        "<yellow,bold>warning</>: cannot resolve disambiguator from artifact {:?}, results may be incorrect: {}",
-                        artifact.filenames,
-                        err,
-                    );
-                    continue;
+                    if !is_target_crate {
+                        let _ = cwriteln!(
+                            werr,
+                            "<yellow,bold>warning</>: cannot resolve disambiguator from artifact {:?}, results may be incorrect: {}",
+                            artifact.filenames,
+                            err,
+                        );
+                    }
+                    CrateName(artifact.target.name.replace("-", "_"))
                 }
             };
 
@@ -344,6 +347,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             .iter()
             .flat_map(|(name, _)| [name.display(true), ", "])
             .collect::<String>();
+        out.pop();
         out.pop();
         let _ = cwriteln!(werr, "crates in dependency graph: {out}");
     }

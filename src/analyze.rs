@@ -141,7 +141,10 @@ pub fn analyze(
                 // Choose the latest crates in topo order, which must be the
                 // latest instantiation location. Use crate name to break the tie.
                 .max_by_key(|&(_, s)| {
-                    let order = crate_topo_order.get(s).copied();
+                    let order = crate_topo_order.get(s).copied().or_else(|| {
+                        let bare_name = s.display(false).to_string();
+                        crate_topo_order.get(&CrateName(bare_name)).copied()
+                    });
                     if order.is_none() {
                         unknown_crates.insert(s.clone());
                     }
