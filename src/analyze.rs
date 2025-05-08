@@ -1,14 +1,18 @@
 use std::{
     borrow::Cow,
+    cmp::Reverse,
     collections::{HashMap, HashSet},
+    io::Read,
+    process::{Command, Stdio},
     sync::LazyLock,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use cargo_metadata::camino::Utf8Path;
 use color_print::cwriteln;
-use goblin::Object;
+use goblin::{Object, elf::Elf};
 use regex_lite::Regex;
+use tempfile::NamedTempFile;
 
 /// Special cases crates that does not appear in dependency graph.
 /// They are not disambiguated.
@@ -18,13 +22,16 @@ pub const SYSROOT_CRATES: &[&str] = &["core", "alloc", "std", "proc_macro", "tes
 
 #[derive(Debug, Default)]
 pub struct Report {
-    pub file_size: u64,
+    pub unstripped: SectionReport,
+    pub stripped: SectionReport,
     pub text_size: u64,
-    pub rodata_size: u64,
-    pub data_size: u64,
-    pub bss_size: u64,
-
     pub funcs: Vec<Func>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SectionReport {
+    pub file_size: u64,
+    pub sections: Vec<(String, u64)>,
 }
 
 #[derive(Debug)]
@@ -83,15 +90,26 @@ impl CrateName {
     }
 }
 
+fn analyze_sections(elf: &Elf<'_>) -> Vec<(String, u64)> {
+    let mut sections = Vec::with_capacity(elf.section_headers.len());
+    for sh in elf.section_headers.iter() {
+        let name = &elf.shdr_strtab[sh.sh_name];
+        let size = sh.sh_size;
+        sections.push((name.to_owned(), size));
+    }
+    sections.sort_by_key(|(_, size)| Reverse(*size));
+    sections
+}
+
 pub fn analyze(
-    exe_path: &Utf8Path,
+    bin_path: &Utf8Path,
     crate_topo_order: &HashMap<CrateName, usize>,
     werr: &mut dyn std::io::Write,
+    verbose: bool,
 ) -> Result<Report> {
     let mut ret = Report::default();
 
-    let bytes = std::fs::read(exe_path).context("failed to read file")?;
-    ret.file_size = bytes.len() as u64;
+    let bytes = std::fs::read(bin_path).context("failed to read file")?;
 
     let obj = Object::parse(&bytes).context("failed to parse object")?;
     let elf = match obj {
@@ -99,21 +117,33 @@ pub fn analyze(
         _ => bail!("TODO: unsupported object type"),
     };
 
-    let mut text_sec_idx = Vec::with_capacity(4);
-    for (idx, sh) in elf.section_headers.iter().enumerate() {
-        let name = &elf.shdr_strtab[sh.sh_name];
-        let size = sh.sh_size;
-        if name.starts_with(".text") {
-            ret.text_size += size;
-            text_sec_idx.push(idx);
-        } else if name.starts_with(".rodata") || name.starts_with(".lrodata") {
-            ret.rodata_size += size;
-        } else if name.starts_with(".bss") || name.starts_with(".lbss") {
-            ret.bss_size += size;
-        } else if name.starts_with(".data") || name.starts_with(".ldata") {
-            ret.data_size += size;
+    ret.unstripped.file_size = bytes.len() as u64;
+    ret.unstripped.sections = analyze_sections(&elf);
+
+    ret.stripped = match analyze_stripped(bin_path, werr, verbose) {
+        Ok(stripped) => stripped,
+        Err(err) => {
+            let _ = cwriteln!(
+                werr,
+                "<yellow,bold>warning</>: failed to strip, fallback to use unstripped file for calculation. {}",
+                err,
+            );
+            ret.unstripped.clone()
         }
-    }
+    };
+
+    let text_sec_idx = elf
+        .section_headers
+        .iter()
+        .enumerate()
+        .filter(|(_, sh)| elf.shdr_strtab[sh.sh_name].starts_with(".text"))
+        .map(|(idx, _)| idx)
+        .collect::<Vec<_>>();
+    ensure!(!text_sec_idx.is_empty(), "missing '.text' section");
+    ret.text_size = text_sec_idx
+        .iter()
+        .map(|&i| elf.section_headers[i].sh_size)
+        .sum();
 
     let mut addr_to_func_idx = HashMap::new();
     let mut unknown_crates = HashSet::new();
@@ -226,6 +256,44 @@ pub fn analyze(
     });
 
     Ok(ret)
+}
+
+fn analyze_stripped(
+    bin_path: &Utf8Path,
+    werr: &mut dyn std::io::Write,
+    verbose: bool,
+) -> Result<SectionReport> {
+    let out_file = NamedTempFile::new().context("failed to create a temp file")?;
+    let strip_exe = std::env::var("STRIP").unwrap_or_else(|_| "strip".into());
+    let mut cmd = Command::new(strip_exe);
+    cmd.args(["-s", "-o"])
+        .arg(out_file.path())
+        .arg(bin_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+
+    if verbose {
+        let _ = cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd);
+    }
+    let st = cmd.status().context("failed to run strip")?;
+    if !st.success() {
+        bail!("strip exited with {:?}", st.code());
+    }
+
+    let mut bytes = Vec::new();
+    out_file
+        .as_file()
+        .read_to_end(&mut bytes)
+        .context("failed to read stripped file")?;
+
+    let file_size = bytes.len() as u64;
+    let elf = Elf::parse(&bytes).context("failed to parse stripped binary")?;
+    let sections = analyze_sections(&elf);
+    Ok(SectionReport {
+        file_size,
+        sections,
+    })
 }
 
 #[derive(Default)]

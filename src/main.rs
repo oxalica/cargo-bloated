@@ -280,7 +280,10 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         cmd.args(["build", "--message-format=json-render-diagnostics"])
             // FIXME: Encode, inherit.
             .env("RUSTFLAGS", "-Cprefer-dynamic -Csymbol-mangling-version=v0")
-            .env(format!("CARGO_PROFILE_{}_STRIP", cli.profile), "none")
+            .env(
+                format!("CARGO_PROFILE_{}_STRIP", cli.profile.to_uppercase()),
+                "false",
+            )
             .stdin(Stdio::inherit())
             .stderr(Stdio::inherit())
             .stdout(Stdio::piped());
@@ -369,18 +372,32 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         })?;
 
     let _ = cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}");
-    let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr)
+    let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr, cli.verbose)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
+    let stripped_size = report.stripped.file_size;
+    let unstripped_size = report.unstripped.file_size;
 
-    #[rustfmt::skip]
-    {
-        writeln!(w, "File size: {}", ByteSize(report.file_size))?;
-        writeln!(w, "    .text: {} {:>5.1}%", ByteSize(report.text_size), perc(report.text_size, report.file_size))?;
-        writeln!(w, "  .rodata: {} {:>5.1}%", ByteSize(report.rodata_size), perc(report.rodata_size, report.file_size))?;
-        writeln!(w, "    .data: {} {:>5.1}%", ByteSize(report.data_size), perc(report.data_size, report.file_size))?;
-        writeln!(w, "     .bss: {} {:>5.1}%", ByteSize(report.bss_size), perc(report.bss_size, report.file_size))?;
-        writeln!(w)?;
-    };
+    // Print section summary of stripped binary.
+    cwriteln!(w, "<underline,bold>   File   Size Section</>",)?;
+    cwriteln!(w, "<dim>100.0% {} (file)</>", ByteSize(stripped_size))?;
+    if stripped_size != unstripped_size {
+        cwriteln!(
+            w,
+            "<dim>{:>5.1}% {} (unstripped)</>",
+            perc(unstripped_size, stripped_size),
+            ByteSize(unstripped_size),
+        )?;
+    }
+    for (name, size) in report.stripped.sections.iter().take(8) {
+        writeln!(
+            w,
+            "{:>5.1}% {} {}",
+            perc(*size, stripped_size),
+            ByteSize(*size),
+            name,
+        )?;
+    }
+    writeln!(w)?;
 
     if let Some(grouping) = cli.crates {
         let unknown_crate = CrateName("?".into());
@@ -407,7 +424,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         cwriteln!(
             w,
             "<dim>{:>5.1}% {:>5.1}% {}  *</>",
-            perc(sum, report.file_size),
+            perc(sum, stripped_size),
             perc(sum, report.text_size),
             ByteSize(sum),
         )?;
@@ -415,7 +432,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             writeln!(
                 w,
                 "{:>5.1}% {:>5.1}% {}  {}",
-                perc(size, report.file_size),
+                perc(size, stripped_size),
                 perc(size, report.text_size),
                 ByteSize(size),
                 name.display(cli.disambig),
@@ -430,7 +447,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             writeln!(
                 w,
                 "{:>5.1}% {:>5.1}% {}  {:32} {}",
-                perc(func.size, report.file_size),
+                perc(func.size, stripped_size),
                 perc(func.size, report.text_size),
                 ByteSize(func.size),
                 func.symbols[0].display_crates(cli.disambig),

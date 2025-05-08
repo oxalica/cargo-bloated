@@ -13,6 +13,7 @@ goblin = "0.9.3"
 regex-lite = "0.1.6"
 rustc-demangle = "0.1.24"
 syn = { version = "2.0.101", default-features = false, features = ["derive", "parsing", "visit"] }
+tempfile = "3.19.1"
 
 [lints.clippy]
 # Use ANSI-aware failable write instead.
