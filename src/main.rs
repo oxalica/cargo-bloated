@@ -1,11 +1,13 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::ffi::OsStr;
 use std::fmt;
 use std::io::{BufReader, Write};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::LazyLock;
 
+use anstream::stream::IsTerminal;
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::Utf8PathBuf;
 use cargo_metadata::{Artifact, Message, MetadataCommand, TargetKind};
@@ -36,6 +38,8 @@ struct Cli {
     verbose: bool,
     #[arg(long, value_enum, default_value_t)]
     output: OutputMode,
+    #[arg(long)]
+    no_pager: bool,
 
     #[arg(long, default_value_t = clap::ColorChoice::Auto)]
     color: clap::ColorChoice,
@@ -65,7 +69,7 @@ struct Cli {
     manifest_path: Option<Utf8PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 enum OutputMode {
     #[default]
     Summary,
@@ -385,8 +389,21 @@ fn main_inner(mut cli: Cli) -> Result<()> {
     let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr, cli.verbose)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 
-    // Now start printing outputs.
-    let mut w = anstream::AutoStream::new(std::io::stdout(), cli.color()).lock();
+    // Setup pager for output, if possible.
+    let mut stdout = std::io::stdout().lock();
+    // Emit colors early based on the stdout, not the pipe of the pager.
+    let stdout_color = anstream::AutoStream::choice(&stdout);
+    let mut pager_child = None;
+    let w: &mut dyn std::io::Write =
+        if cli.no_pager || cli.output == OutputMode::Summary || !stdout.is_terminal() {
+            &mut stdout
+        } else if let Some(child) = detect_spawn_pager() {
+            pager_child.insert(child).stdin.as_mut().unwrap()
+        } else {
+            &mut stdout
+        };
+    let mut w = anstream::AutoStream::new(w, stdout_color);
+
     let (show_sections, show_crates, show_functions) = match cli.output {
         OutputMode::Summary => (Some(4), Some(8), Some(8)),
         OutputMode::Sections => (Some(usize::MAX), None, None),
@@ -490,6 +507,12 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         }
     }
 
+    if let Some(mut child) = pager_child {
+        // Flush and drop the pipe, indicating EOF.
+        child.stdin.take();
+        child.wait().context("failed to wait pager")?;
+    }
+
     Ok(())
 }
 
@@ -520,6 +543,42 @@ fn get_crate_name_from_artifact(artifact: &Artifact) -> Result<CrateName> {
     }
 
     bail!("cannot find disambiguator from rlib");
+}
+
+fn detect_spawn_pager() -> Option<Child> {
+    fn try_spawn(s: &[&OsStr]) -> Option<Child> {
+        Command::new(s[0])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .args(&s[1..])
+            .spawn()
+            .ok()
+    }
+
+    let pager = std::env::var_os("PAGER");
+    if pager == Some(Default::default()) {
+        // Explicitly disabled.
+        return None;
+    }
+
+    // Prefer `less` for custom options.
+    if let Ok(less_path) = which::which_global("less") {
+        if let Some(child) = try_spawn(&[
+            less_path.as_ref(),
+            "--chop-long-lines".as_ref(),
+            "--RAW-CONTROL-CHARS".as_ref(),
+        ]) {
+            return Some(child);
+        }
+    }
+
+    if let Some(pager) = pager {
+        if let Some(child) = try_spawn(&["/bin/sh".as_ref(), "-c".as_ref(), pager.as_ref()]) {
+            return Some(child);
+        }
+    }
+    try_spawn(&["more".as_ref()])
 }
 
 struct ByteSize(u64);
