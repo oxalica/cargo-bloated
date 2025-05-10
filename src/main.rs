@@ -24,23 +24,18 @@ enum CargoCli {
     Bloated(Cli),
 }
 
-#[derive(Debug, Default, Clone, clap::ValueEnum)]
-enum CrateGrouping {
-    #[default]
-    Primary,
-    Mention,
-}
-
 #[derive(Debug, clap::Args)]
 struct Cli {
-    #[arg(long, num_args(0..=1), require_equals = true, default_missing_value = "primary")]
-    crates: Option<CrateGrouping>,
-    #[arg(long, conflicts_with = "crates")]
+    #[arg(long, num_args(0..=1), default_value = "primary")]
+    crates_grouping: CrateGrouping,
+    #[arg(long)]
     mangled: bool,
     #[arg(long)]
     disambig: bool,
     #[arg(long, short)]
     verbose: bool,
+    #[arg(long, value_enum, default_value_t)]
+    output: OutputMode,
 
     #[arg(long, default_value_t = clap::ColorChoice::Auto)]
     color: clap::ColorChoice,
@@ -68,6 +63,22 @@ struct Cli {
     frozen: bool,
     #[arg(long)]
     manifest_path: Option<Utf8PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum OutputMode {
+    #[default]
+    Summary,
+    Sections,
+    Functions,
+    Crates,
+}
+
+#[derive(Debug, Default, Clone, clap::ValueEnum)]
+enum CrateGrouping {
+    #[default]
+    Primary,
+    Mention,
 }
 
 #[derive(Debug, clap::Args)]
@@ -177,7 +188,6 @@ fn main() -> Result<()> {
 
 fn main_inner(mut cli: Cli) -> Result<()> {
     let cargo_path = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    let mut w = anstream::AutoStream::new(std::io::stdout(), cli.color()).lock();
     // Stderr is not performance critical. Do not lock to ease debugging experience.
     let mut werr = anstream::AutoStream::new(std::io::stderr(), cli.color());
 
@@ -374,37 +384,49 @@ fn main_inner(mut cli: Cli) -> Result<()> {
     let _ = cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}");
     let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr, cli.verbose)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
+
+    // Now start printing outputs.
+    let mut w = anstream::AutoStream::new(std::io::stdout(), cli.color()).lock();
+    let (show_sections, show_crates, show_functions) = match cli.output {
+        OutputMode::Summary => (Some(4), Some(8), Some(8)),
+        OutputMode::Sections => (Some(usize::MAX), None, None),
+        OutputMode::Crates => (None, Some(usize::MAX), None),
+        OutputMode::Functions => (None, None, Some(usize::MAX)),
+    };
     let stripped_size = report.stripped.file_size;
     let unstripped_size = report.unstripped.file_size;
 
-    // Print section summary of stripped binary.
-    cwriteln!(w, "<underline,bold>   File   Size Section</>",)?;
-    cwriteln!(w, "<dim>100.0% {} (file)</>", ByteSize(stripped_size))?;
-    if stripped_size != unstripped_size {
-        cwriteln!(
-            w,
-            "<dim>{:>5.1}% {} (unstripped)</>",
-            perc(unstripped_size, stripped_size),
-            ByteSize(unstripped_size),
-        )?;
+    // Sections.
+    if let Some(max_len) = show_sections {
+        cwriteln!(w, "<underline,bold>   File   Size Section</>",)?;
+        cwriteln!(w, "<dim>100.0% {} (file)</>", ByteSize(stripped_size))?;
+        if stripped_size != unstripped_size {
+            cwriteln!(
+                w,
+                "<dim>{:>5.1}% {} (unstripped)</>",
+                perc(unstripped_size, stripped_size),
+                ByteSize(unstripped_size),
+            )?;
+        }
+        for (name, size) in report.stripped.sections.iter().take(max_len) {
+            writeln!(
+                w,
+                "{:>5.1}% {} {}",
+                perc(*size, stripped_size),
+                ByteSize(*size),
+                name,
+            )?;
+        }
+        writeln!(w)?;
     }
-    for (name, size) in report.stripped.sections.iter().take(8) {
-        writeln!(
-            w,
-            "{:>5.1}% {} {}",
-            perc(*size, stripped_size),
-            ByteSize(*size),
-            name,
-        )?;
-    }
-    writeln!(w)?;
 
-    if let Some(grouping) = cli.crates {
+    // Crates.
+    if let Some(max_len) = show_crates {
         let unknown_crate = CrateName("?".into());
         let mut crate_tally = <HashMap<&CrateName, u64>>::new();
         for func in &report.funcs {
             let sym = &func.symbols[0];
-            match grouping {
+            match cli.crates_grouping {
                 CrateGrouping::Primary => {
                     let name = sym.primary_crate().unwrap_or(&unknown_crate);
                     *crate_tally.entry(name).or_default() += func.size;
@@ -428,7 +450,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             perc(sum, report.text_size),
             ByteSize(sum),
         )?;
-        for (name, size) in crate_tally {
+        for &(name, size) in crate_tally.iter().take(max_len) {
             writeln!(
                 w,
                 "{:>5.1}% {:>5.1}% {}  {}",
@@ -438,12 +460,16 @@ fn main_inner(mut cli: Cli) -> Result<()> {
                 name.display(cli.disambig),
             )?;
         }
-    } else {
+        writeln!(w)?;
+    }
+
+    // Functions.
+    if let Some(max_len) = show_functions {
         cwriteln!(
             w,
             "<underline,bold>  File  .text    Size  Crates                           Name</>"
         )?;
-        for func in &report.funcs {
+        for func in report.funcs.iter().take(max_len) {
             writeln!(
                 w,
                 "{:>5.1}% {:>5.1}% {}  {:32} {}",
