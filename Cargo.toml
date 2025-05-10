@@ -20,3 +20,7 @@ which = "7.0.3"
 # Use ANSI-aware failable write instead.
 print_stdout = "warn"
 print_stderr = "warn"
+
+[profile.release]
+lto = true
+strip = true

@@ -291,13 +291,12 @@ fn main_inner(mut cli: Cli) -> Result<()> {
 
     let artifact = {
         let mut cmd = Command::new(&cargo_path);
+        let profile_env = cli.profile.to_uppercase();
         cmd.args(["build", "--message-format=json-render-diagnostics"])
             // FIXME: Encode, inherit.
             .env("RUSTFLAGS", "-Cprefer-dynamic -Csymbol-mangling-version=v0")
-            .env(
-                format!("CARGO_PROFILE_{}_STRIP", cli.profile.to_uppercase()),
-                "false",
-            )
+            .env(format!("CARGO_PROFILE_{profile_env}_STRIP",), "false")
+            .env(format!("CARGO_PROFILE_{profile_env}_LTO"), "false")
             .stdin(Stdio::inherit())
             .stderr(Stdio::inherit())
             .stdout(Stdio::piped());
