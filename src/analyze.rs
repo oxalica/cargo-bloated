@@ -14,6 +14,8 @@ use goblin::{Object, elf::Elf};
 use regex_lite::Regex;
 use tempfile::NamedTempFile;
 
+use crate::StatusWriter;
+
 /// Special cases crates that does not appear in dependency graph.
 /// They are not disambiguated.
 ///
@@ -104,8 +106,7 @@ fn analyze_sections(elf: &Elf<'_>) -> Vec<(String, u64)> {
 pub fn analyze(
     bin_path: &Utf8Path,
     crate_topo_order: &HashMap<CrateName, usize>,
-    werr: &mut dyn std::io::Write,
-    verbose: bool,
+    werr: &mut StatusWriter<'_>,
 ) -> Result<Report> {
     let mut ret = Report::default();
 
@@ -120,14 +121,13 @@ pub fn analyze(
     ret.unstripped.file_size = bytes.len() as u64;
     ret.unstripped.sections = analyze_sections(&elf);
 
-    ret.stripped = match analyze_stripped(bin_path, werr, verbose) {
+    ret.stripped = match analyze_stripped(bin_path, werr) {
         Ok(stripped) => stripped,
         Err(err) => {
-            let _ = cwriteln!(
-                werr,
-                "<yellow,bold>warning</>: failed to strip, fallback to use unstripped file for calculation. {}",
+            werr.error(format_args!(
+                "failed to strip, fallback to use unstripped file for calculation. {}",
                 err,
-            );
+            ));
             ret.unstripped.clone()
         }
     };
@@ -206,11 +206,10 @@ pub fn analyze(
     if !unknown_crates.is_empty() {
         let mut unknown_crates = unknown_crates.into_iter().collect::<Vec<_>>();
         unknown_crates.sort_unstable();
-        let _ = cwriteln!(
-            werr,
-            "<yellow,bold>warning</>: cannot locate dependencies of some crates, results may be incorrect: {:?}",
+        werr.warn(format_args!(
+            "cannot locate dependencies of some crates, results may be incorrect: {:?}",
             unknown_crates,
-        );
+        ));
     }
 
     for f in &mut ret.funcs {
@@ -258,11 +257,7 @@ pub fn analyze(
     Ok(ret)
 }
 
-fn analyze_stripped(
-    bin_path: &Utf8Path,
-    werr: &mut dyn std::io::Write,
-    verbose: bool,
-) -> Result<SectionReport> {
+fn analyze_stripped(bin_path: &Utf8Path, werr: &mut StatusWriter<'_>) -> Result<SectionReport> {
     let out_file = NamedTempFile::new().context("failed to create a temp file")?;
     let strip_exe = std::env::var("STRIP").unwrap_or_else(|_| "strip".into());
     let mut cmd = Command::new(strip_exe);
@@ -273,9 +268,9 @@ fn analyze_stripped(
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
 
-    if verbose {
-        let _ = cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd);
-    }
+    werr.with(1, |werr| {
+        cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd)
+    });
     let st = cmd.status().context("failed to run strip")?;
     if !st.success() {
         bail!("strip exited with {:?}", st.code());

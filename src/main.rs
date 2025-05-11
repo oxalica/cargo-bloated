@@ -11,6 +11,7 @@ use anstream::stream::IsTerminal;
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::Utf8PathBuf;
 use cargo_metadata::{Artifact, Message, MetadataCommand, TargetKind};
+use clap::ArgAction;
 use color_print::cwriteln;
 use regex_lite::Regex;
 
@@ -34,9 +35,27 @@ struct Cli {
     /// Include disambiguators for demangled crate names.
     #[arg(long)]
     disambiguator: bool,
-    /// Use verbose output.
-    #[arg(long, short)]
-    verbose: bool,
+    /// Use verbose output for cargo-bloated.
+    ///
+    /// Note: this option is not automatically passed to `cargo` to allow
+    /// individual control. Use `-- --verbose` if you want to pass it to `cargo`.
+    #[arg(long, short, action = ArgAction::Count)]
+    verbose: u8,
+    /// Do not print log messages from cargo-bloated.
+    ///
+    /// Note: this option is not automatically passed to `cargo` to allow
+    /// individual control. Use `-- --quiet` if you want to pass it to `cargo`.
+    #[arg(long, short, conflicts_with = "verbose")]
+    quiet: bool,
+    /// Do not automatically use `PAGER` to long outputs.
+    /// This option is implied if stdout is not TTY, `PAGER` environment is an
+    /// empty string, or `--output=summary` (the default value).
+    #[arg(long)]
+    no_pager: bool,
+    /// Coloring.
+    #[arg(long, default_value_t = clap::ColorChoice::Auto)]
+    color: clap::ColorChoice,
+
     /// Output format for analysis report.
     ///
     /// Output fields for `--output=functions`:
@@ -53,14 +72,6 @@ struct Cli {
     /// - `Crate` : The crate name.
     #[arg(long, value_enum, default_value_t, verbatim_doc_comment)]
     output: OutputMode,
-    /// Do not automatically use `PAGER` to long outputs.
-    /// This option is implied if stdout is not TTY, `PAGER` environment is an
-    /// empty string, or `--output=summary` (the default value).
-    #[arg(long)]
-    no_pager: bool,
-    /// Coloring.
-    #[arg(long, default_value_t = clap::ColorChoice::Auto)]
-    color: clap::ColorChoice,
 
     /// (unstable) Change how to decide which crate to blame for a given symbol.
     #[arg(long, default_value = "primary", hide = true)]
@@ -225,6 +236,31 @@ impl Cli {
     }
 }
 
+struct StatusWriter<'a> {
+    werr: &'a mut dyn std::io::Write,
+    verbosity: i8,
+}
+
+impl StatusWriter<'_> {
+    fn with(
+        &mut self,
+        verbosity: i8,
+        f: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
+    ) {
+        if verbosity <= self.verbosity {
+            let _ = f(self.werr);
+        }
+    }
+
+    fn warn(&mut self, f: impl fmt::Display) {
+        self.with(-1, |w| cwriteln!(w, "<yellow,bold>warning</>: {}", f));
+    }
+
+    fn error(&mut self, f: impl fmt::Display) {
+        self.with(-2, |w| cwriteln!(w, "<red,bold>error</>: {}", f));
+    }
+}
+
 fn main() -> Result<()> {
     let CargoCli::Bloated(cli) = <CargoCli as clap::Parser>::parse();
     match main_inner(cli) {
@@ -245,8 +281,15 @@ fn main() -> Result<()> {
 
 fn main_inner(mut cli: Cli) -> Result<()> {
     let cargo_path = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    // Stderr is not performance critical. Do not lock to ease debugging experience.
-    let mut werr = anstream::AutoStream::new(std::io::stderr(), cli.color());
+    let mut werr = StatusWriter {
+        // Stderr is not performance critical. Do not lock to ease debugging experience.
+        werr: &mut anstream::AutoStream::new(std::io::stderr(), cli.color()),
+        verbosity: if cli.quiet {
+            -1
+        } else {
+            i8::try_from(cli.verbose).unwrap_or(i8::MAX)
+        },
+    };
 
     let cargo_meta = {
         let mut cmd = MetadataCommand::new()
@@ -257,9 +300,9 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
 
-        if cli.verbose {
-            let _ = cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd);
-        }
+        werr.with(1, |werr| {
+            cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd)
+        });
         let output = cmd.output().context("failed to run `cargo metadata`")?;
         if !output.status.success() {
             std::process::exit(output.status.code().unwrap_or(1));
@@ -354,9 +397,9 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             .stderr(Stdio::inherit())
             .stdout(Stdio::piped());
         cli.extend_cargo_build_args(&mut cmd);
-        if cli.verbose {
-            let _ = cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd);
-        }
+        werr.with(1, |werr| {
+            cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd)
+        });
         let mut child = cmd.spawn().context("failed to run `cargo build`")?;
 
         let reader = BufReader::new(child.stdout.take().unwrap());
@@ -377,12 +420,15 @@ fn main_inner(mut cli: Cli) -> Result<()> {
                 Ok(crate_name) => crate_name,
                 Err(err) => {
                     if !is_target_crate {
-                        let _ = cwriteln!(
-                            werr,
-                            "<yellow,bold>warning</>: cannot resolve disambiguator from artifact {:?}, results may be incorrect: {}",
-                            artifact.filenames,
-                            err,
-                        );
+                        werr.with(1, |werr| {
+                            cwriteln!(
+                                werr,
+                                "<cyan,bold>note</>: cannot resolve disambiguator \
+                                from artifact {:?}: {}",
+                                artifact.filenames,
+                                err,
+                            )
+                        });
                     }
                     CrateName(artifact.target.name.replace("-", "_"))
                 }
@@ -391,11 +437,11 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             let next_idx = crate_topo_order.len();
             match crate_topo_order.entry(crate_name) {
                 Entry::Occupied(ent) => {
-                    let _ = cwriteln!(
-                        werr,
-                        "<yellow,bold>warning</>: duplicated crate names in dependency graph, results may be incorrect: {}",
+                    werr.warn(format_args!(
+                        "duplicated crate names without disambiguator in dependency graph, \
+                        results may be incorrect: {}",
                         ent.key().0,
-                    );
+                    ));
                 }
                 Entry::Vacant(ent) => {
                     ent.insert(next_idx);
@@ -409,7 +455,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         final_artifact.context("artifact is not produced")?
     };
 
-    if cli.verbose {
+    werr.with(1, |werr| {
         let mut ordered_crates = crate_topo_order.iter().collect::<Vec<_>>();
         ordered_crates.sort_unstable_by_key(|(_, ord)| **ord);
         let mut out = ordered_crates
@@ -418,8 +464,12 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             .collect::<String>();
         out.pop();
         out.pop();
-        let _ = cwriteln!(werr, "crates in dependency graph: {out}");
-    }
+        cwriteln!(
+            werr,
+            "<cyan,bold>note</>: crates in dependency graph: {}",
+            out,
+        )
+    });
 
     let exe_path = artifact
         .executable
@@ -437,8 +487,10 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             )
         })?;
 
-    let _ = cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}");
-    let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr, cli.verbose)
+    werr.with(0, |werr| {
+        cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}")
+    });
+    let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 
     // Setup pager for output, if possible.
