@@ -1,6 +1,5 @@
 # cargo-bloated
 
-[![github](https://img.shields.io/crates/v/cargo-bloated)](https://crates.io/crates/cargo-bloated)
 [![crates.io](https://img.shields.io/crates/v/cargo-bloated)](https://crates.io/crates/cargo-bloated)
 
 Find out what takes most of the space in your executable, more accurately.
