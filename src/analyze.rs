@@ -16,12 +16,6 @@ use tempfile::NamedTempFile;
 
 use crate::{ExitStatusExt, StatusWriter};
 
-/// Special cases crates that does not appear in dependency graph.
-/// They are not disambiguated.
-///
-/// Defined in topological order.
-pub const SYSROOT_CRATES: &[&str] = &["core", "alloc", "std", "proc_macro", "test"];
-
 #[derive(Debug, Default)]
 pub struct Report {
     pub unstripped: SectionReport,
@@ -89,6 +83,10 @@ impl CrateName {
             Some((name, _)) => name,
             None => &self.0,
         }
+    }
+
+    pub fn without_disambig(&self) -> Self {
+        Self(self.display(false).into())
     }
 }
 
@@ -170,15 +168,16 @@ pub fn analyze(
                 // Choose the latest crates in topo order, which must be the
                 // latest instantiation location. Use crate name to break the tie.
                 .max_by_key(|&(_, s)| {
-                    let order = crate_topo_order.get(s).copied().or_else(|| {
-                        let bare_name = s.display(false).to_string();
-                        crate_topo_order.get(&CrateName(bare_name)).copied()
-                    });
-                    if order.is_none() {
+                    let order = if let Some(&order) = crate_topo_order.get(s) {
+                        order
+                    } else if let Some(&order) = crate_topo_order.get(&s.without_disambig()) {
+                        order
+                    } else {
                         unknown_crates.insert(s.clone());
-                    }
-                    // Default to max order for unknown crates, assuming they are user crates.
-                    (order.unwrap_or(!0usize), s)
+                        // Default to max order for unknown crates, assuming they are user crates.
+                        !0usize
+                    };
+                    (order, s)
                 })
             {
                 crates.swap(0, idx);
@@ -313,14 +312,8 @@ impl CrateCollector {
             return;
         }
         let name = match ident.split_once(DISAMBIG_SEP) {
-            Some((name, disambig)) => {
-                if SYSROOT_CRATES.contains(&name) {
-                    name.into()
-                } else {
-                    format!("{name}[{disambig}]")
-                }
-            }
-            _ => ident,
+            Some((name, disambig)) => format!("{name}[{disambig}]"),
+            None => ident,
         };
         self.crate_names.insert(CrateName(name));
     }
@@ -369,4 +362,106 @@ fn find_func_crates(demangled_name: &str) -> Option<HashSet<CrateName>> {
         v.crate_names.insert(CrateName("std".into()));
     }
     Some(v.crate_names)
+}
+
+/// Extract disambiguators from file names in the rlib archive.
+/// This is undocumented and may change across rustc versions. But I cannot find
+/// a better way to do so.
+static RE_DISAMBIG_HASH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b(\w+)\.([[:xdigit:]]+)-cgu").unwrap());
+
+pub fn get_crate_name_from_artifact(artifact: &cargo_metadata::Artifact) -> Result<CrateName> {
+    let bare_name = artifact.target.name.replace("-", "_");
+
+    let rlib_path = artifact
+        .filenames
+        .iter()
+        .find(|path| path.extension() == Some("rlib"))
+        .with_context(|| format!("missing rlib output from {:?}", artifact.filenames))?;
+    let bytes = std::fs::read(rlib_path).with_context(|| format!("failed to read {rlib_path}"))?;
+    let archive = goblin::archive::Archive::parse(&bytes)
+        .with_context(|| format!("failed to parse {rlib_path}"))?;
+    for member in archive.members() {
+        if let Some(m) = RE_DISAMBIG_HASH.captures(member) {
+            let name = m.get(1).unwrap().as_str();
+            if name == bare_name {
+                let disambig = m.get(2).unwrap().as_str();
+                return Ok(CrateName(format!("{bare_name}[{disambig}]")));
+            }
+        }
+    }
+
+    bail!("cannot find disambiguator from rlib");
+}
+
+pub fn sysroot_crate_names(werr: &mut StatusWriter<'_>) -> Result<Vec<CrateName>> {
+    fn run_cmd(args: &[&str]) -> Result<String> {
+        let mut cmd = Command::new(args[0]);
+        cmd.args(&args[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        cmd.output()
+            .map_err(Into::into)
+            .and_then(|st| {
+                st.status.exit_ok()?;
+                let mut s = String::from_utf8(st.stdout)?;
+                s.truncate(s.trim_ascii_end().len());
+                anyhow::Ok(s)
+            })
+            .with_context(|| format!("failed to run {cmd:?}"))
+    }
+
+    let rustc_path = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
+    let host_target = run_cmd(&[&rustc_path, "--print=host-tuple"])?;
+    let sysroot = run_cmd(&[&rustc_path, "--print=sysroot"])?;
+    let sysroot_lib_path = Utf8Path::new(&sysroot).join(format!("lib/rustlib/{host_target}/lib"));
+
+    let std_dylib_path = sysroot_lib_path
+        .read_dir_utf8()
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .find(|ent| ent.file_name().starts_with("libstd-") && ent.file_name().ends_with(".so"))
+        .map(|ent| ent.into_path())
+        .with_context(|| format!("cannot locate libstd*.so under sysroot: {sysroot_lib_path}"))?;
+
+    let bytes = std::fs::read(&std_dylib_path)
+        .with_context(|| format!("failed to read {std_dylib_path}"))?;
+    let elf = Elf::parse(&bytes).with_context(|| format!("failed to parse {std_dylib_path}"))?;
+
+    let mut crate_names = elf
+        .syms
+        .iter()
+        .filter_map(|sym| {
+            (sym.st_type() == goblin::elf::sym::STT_FILE).then_some(())?;
+            let sym_name = &elf.strtab[sym.st_name];
+            let m = RE_DISAMBIG_HASH.captures(sym_name)?;
+            let bare_name = m.get(1).unwrap().as_str();
+            let disambig = m.get(2).unwrap().as_str();
+            Some(CrateName(format!("{bare_name}[{disambig}]")))
+        })
+        .collect::<Vec<_>>();
+    crate_names.sort_unstable();
+    crate_names.dedup();
+
+    werr.note(format_args!("sysroot crates: {crate_names:?}"));
+
+    // FIXME: Need to typosort them correctly using std's dependency graph.
+    let core_idx = crate_names
+        .iter()
+        .position(|name| name.0.starts_with("core["))
+        .context("libcore not found")?;
+    crate_names.swap(0, core_idx);
+    let std_idx = crate_names
+        .iter()
+        .position(|name| name.0.starts_with("std["))
+        .context("libstd not found")?;
+    let len = crate_names.len();
+    crate_names.swap(std_idx, len - 1);
+
+    crate_names[1..len - 1].sort_unstable();
+
+    Ok(crate_names)
 }

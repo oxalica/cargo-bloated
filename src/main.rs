@@ -5,17 +5,15 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{BufReader, Write};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
-use std::sync::LazyLock;
 
 use anstream::stream::IsTerminal;
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::Utf8PathBuf;
-use cargo_metadata::{Artifact, Message, MetadataCommand, TargetKind};
+use cargo_metadata::{Message, MetadataCommand, TargetKind};
 use clap::ArgAction;
 use color_print::cwriteln;
-use regex_lite::Regex;
 
-use crate::analyze::{CrateName, SYSROOT_CRATES};
+use crate::analyze::{CrateName, get_crate_name_from_artifact, sysroot_crate_names};
 
 mod analyze;
 
@@ -252,6 +250,10 @@ impl StatusWriter<'_> {
         }
     }
 
+    fn note(&mut self, f: impl fmt::Display) {
+        self.with(1, |w| cwriteln!(w, "<cyan,bold>note</>: {}", f));
+    }
+
     fn warn(&mut self, f: impl fmt::Display) {
         self.with(-1, |w| cwriteln!(w, "<yellow,bold>warning</>: {}", f));
     }
@@ -341,10 +343,12 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
 
     let (target, target_display) = select_pkg_target(&mut cli, pkg)?;
 
-    let mut crate_topo_order = SYSROOT_CRATES
-        .iter()
+    let mut crate_topo_order = sysroot_crate_names(werr)
+        .context("failed to search std's dependencies")?
+        .into_iter()
         .enumerate()
-        .map(|(idx, &name)| (CrateName(name.to_owned()), idx))
+        // Also include the name without disambiguator, for legacy symbols.
+        .flat_map(|(idx, name)| [(name.without_disambig(), idx), (name, idx)])
         .collect::<HashMap<CrateName, usize>>();
 
     let artifact = {
@@ -384,15 +388,10 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
                 Ok(crate_name) => crate_name,
                 Err(err) => {
                     if !is_target_crate {
-                        werr.with(1, |werr| {
-                            cwriteln!(
-                                werr,
-                                "<cyan,bold>note</>: cannot resolve disambiguator \
-                                from artifact {:?}: {}",
-                                artifact.filenames,
-                                err,
-                            )
-                        });
+                        werr.note(format_args!(
+                            "cannot resolve disambiguator from artifact {:?}: {}",
+                            artifact.filenames, err,
+                        ));
                     }
                     CrateName(artifact.target.name.replace("-", "_"))
                 }
@@ -420,21 +419,17 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
         final_artifact.context("artifact is not produced")?
     };
 
-    werr.with(1, |werr| {
+    if werr.verbosity >= 1 {
         let mut ordered_crates = crate_topo_order.iter().collect::<Vec<_>>();
         ordered_crates.sort_unstable_by_key(|(_, ord)| **ord);
-        let mut out = ordered_crates
+        let mut graph = ordered_crates
             .iter()
             .flat_map(|(name, _)| [name.display(true), ", "])
             .collect::<String>();
-        out.pop();
-        out.pop();
-        cwriteln!(
-            werr,
-            "<cyan,bold>note</>: crates in dependency graph: {}",
-            out,
-        )
-    });
+        graph.pop();
+        graph.pop();
+        werr.note(format_args!("crates in dependency graph: {graph}"));
+    }
 
     let exe_path = artifact
         .executable
@@ -661,31 +656,6 @@ fn select_pkg_target<'m>(
             pkg.name,
         );
     }
-}
-
-fn get_crate_name_from_artifact(artifact: &Artifact) -> Result<CrateName> {
-    static RE_DISAMBIG_HASH: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"\.[[:xdigit:]]+-cgu").unwrap());
-
-    let bare_name = artifact.target.name.replace("-", "_");
-
-    let rlib_path = artifact
-        .filenames
-        .iter()
-        .find(|path| path.extension() == Some("rlib"))
-        .context("missing rlib output")?;
-    let bytes = std::fs::read(rlib_path).with_context(|| format!("failed to read {rlib_path}"))?;
-    let archive = goblin::archive::Archive::parse(&bytes)
-        .with_context(|| format!("failed to parse {rlib_path}"))?;
-    for member in archive.members() {
-        if let Some(m) = RE_DISAMBIG_HASH.find(member) {
-            let m = m.as_str();
-            let meta = &m[1..m.len() - 4];
-            return Ok(CrateName(format!("{bare_name}[{meta}]")));
-        }
-    }
-
-    bail!("cannot find disambiguator from rlib");
 }
 
 fn detect_spawn_pager() -> Option<Child> {
