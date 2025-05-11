@@ -12,6 +12,7 @@ use cargo_metadata::camino::Utf8PathBuf;
 use cargo_metadata::{Message, MetadataCommand, TargetKind};
 use clap::ArgAction;
 use color_print::cwriteln;
+use itertools::Itertools;
 
 use crate::analyze::{CrateName, get_crate_name_from_artifact, sysroot_crate_names};
 
@@ -189,7 +190,6 @@ impl Cli {
 
     fn extend_cargo_build_args(&self, cmd: &mut Command) {
         if self.target.lib {
-            // FIXME: This should also recognize dylib and staticlib.
             cmd.arg("--lib");
         } else if let Some(name) = &self.target.bin {
             cmd.arg("--bin").arg(name);
@@ -352,11 +352,27 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
         .collect::<HashMap<CrateName, usize>>();
 
     let artifact = {
+        let mut enc_rustflags = if let Some(s) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
+            s.into_string()
+                .ok()
+                .context("CARGO_ENCODED_RUSTFLAGS is not UTF-8")?
+        } else if let Some(s) = std::env::var_os("RUSTFLAGS") {
+            s.to_str()
+                .context("RUSTFLAGS is not UTF-8")?
+                .split_ascii_whitespace()
+                .join("\x1F")
+        } else {
+            String::new()
+        };
+        if !enc_rustflags.is_empty() {
+            enc_rustflags.push('\x1F');
+        }
+        enc_rustflags.push_str("-Cprefer-dynamic\x1F-Csymbol-mangling-version=v0");
+
         let mut cmd = Command::new(&cargo_path);
         let profile_env = cli.profile.to_uppercase();
         cmd.args(["build", "--message-format=json-render-diagnostics"])
-            // FIXME: Encode, inherit.
-            .env("RUSTFLAGS", "-Cprefer-dynamic -Csymbol-mangling-version=v0")
+            .env("CARGO_ENCODED_RUSTFLAGS", enc_rustflags)
             .env(format!("CARGO_PROFILE_{profile_env}_STRIP",), "false")
             .env(format!("CARGO_PROFILE_{profile_env}_LTO"), "false")
             .stdin(Stdio::inherit())
@@ -422,12 +438,10 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
     if werr.verbosity >= 1 {
         let mut ordered_crates = crate_topo_order.iter().collect::<Vec<_>>();
         ordered_crates.sort_unstable_by_key(|(_, ord)| **ord);
-        let mut graph = ordered_crates
+        let graph = ordered_crates
             .iter()
-            .flat_map(|(name, _)| [name.display(true), ", "])
-            .collect::<String>();
-        graph.pop();
-        graph.pop();
+            .map(|(name, _)| name.display(true))
+            .join(", ");
         werr.note(format_args!("crates in dependency graph: {graph}"));
     }
 
