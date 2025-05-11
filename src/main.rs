@@ -331,53 +331,13 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             }
         }
         let default_pkg = default_pkg
-            .context("multiple packages are available, use `--package` to select one")?;
+            .context("multiple packages are available, use `--package=NAME` to select one")?;
         let pkg = &cargo_meta[default_pkg];
         cli.package = Some(pkg.name.clone());
         pkg
     };
 
-    let target = if cli.target.is_set() {
-        let (tgt_kind, name) = if cli.target.lib {
-            (TargetKind::Lib, None)
-        } else if let Some(name) = &cli.target.bin {
-            (TargetKind::Bin, Some(name))
-        } else if let Some(name) = &cli.target.test {
-            (TargetKind::Test, Some(name))
-        } else if let Some(name) = &cli.target.bench {
-            (TargetKind::Bench, Some(name))
-        } else if let Some(name) = &cli.target.example {
-            (TargetKind::Example, Some(name))
-        } else {
-            unreachable!()
-        };
-        pkg.targets
-            .iter()
-            .find(|tgt| tgt.is_kind(tgt_kind.clone()) && name.is_none_or(|name| *name == tgt.name))
-            .context("cannot found specified target")?
-    } else {
-        // Only auto-select lib or bin targets.
-        let targets = pkg
-            .targets
-            .iter()
-            .filter(|tgt| tgt.is_lib() || tgt.is_bin())
-            .collect::<Vec<_>>();
-
-        if targets.len() != 1 {
-            bail!(
-                "multiple targets are available for package '{}', \
-                use --lib, --bin=BIN, --test=TEST or --example=EXAMPLE to select one",
-                pkg.name,
-            );
-        }
-        let tgt = targets[0];
-        if tgt.is_lib() {
-            cli.target.lib = true;
-        } else {
-            cli.target.bin = Some(tgt.name.clone());
-        }
-        tgt
-    };
+    let (target, target_display) = select_pkg_target(&mut cli, pkg)?;
 
     let mut crate_topo_order = SYSROOT_CRATES
         .iter()
@@ -478,7 +438,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             artifact
                 .filenames
                 .iter()
-                .find(|p| p.extension() == Some("rlib"))
+                .find(|p| p.extension() == Some("so"))
         })
         .with_context(|| {
             format!(
@@ -488,7 +448,10 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         })?;
 
     werr.with(0, |werr| {
-        cwriteln!(werr, "<cyan,bold>   Analyzing</> {exe_path}")
+        cwriteln!(
+            werr,
+            "<cyan,bold>   Analyzing</> {target_display}: {exe_path}"
+        )
     });
     let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
@@ -622,6 +585,77 @@ fn main_inner(mut cli: Cli) -> Result<()> {
 
 fn perc(x: u64, y: u64) -> f32 {
     x as f32 / y as f32 * 100.0
+}
+
+fn select_pkg_target<'m>(
+    cli: &mut Cli,
+    pkg: &'m cargo_metadata::Package,
+) -> Result<(&'m cargo_metadata::Target, String)> {
+    let tgt_name_display = |tgt: &cargo_metadata::Target| {
+        if tgt.is_cdylib() {
+            "dynamic system library"
+        } else {
+            "dynamic Rust library"
+        }
+        .to_owned()
+    };
+
+    if cli.target.is_set() {
+        if cli.target.lib {
+            // Note: dylib and cdylib cannot be used together.
+            let tgt = pkg
+                .targets
+                .iter()
+                .find(|tgt| tgt.is_cdylib() || tgt.is_dylib())
+                .context(
+                    "cannot find 'cdylib' or 'dylib' target. \
+                    Note that 'lib', 'rlib' and 'staticlib' are not supported yet.",
+                )?;
+            return Ok((tgt, tgt_name_display(tgt)));
+        }
+
+        let (expect_kind, name, display) = if let Some(name) = &cli.target.bin {
+            (TargetKind::Bin, name, format!("binary {name:?}"))
+        } else if let Some(name) = &cli.target.test {
+            (TargetKind::Test, name, format!("test {name:?}"))
+        } else if let Some(name) = &cli.target.bench {
+            (TargetKind::Bench, name, format!("bench {name:?}"))
+        } else if let Some(name) = &cli.target.example {
+            (TargetKind::Example, name, format!("example {name:?}"))
+        } else {
+            unreachable!()
+        };
+        let tgt = pkg
+            .targets
+            .iter()
+            .find(|tgt| tgt.is_kind(expect_kind.clone()) && *name == tgt.name)
+            .context("cannot find specified target")?;
+        return Ok((tgt, display));
+    }
+
+    // Prefer the only binary target. If there is no binary target, use library target.
+    let bin_targets = pkg
+        .targets
+        .iter()
+        .filter(|tgt| tgt.is_bin())
+        .collect::<Vec<_>>();
+    let lib_target = pkg
+        .targets
+        .iter()
+        .find(|tgt| tgt.is_cdylib() || tgt.is_dylib());
+    if let &[tgt] = &*bin_targets {
+        cli.target.bin = Some(tgt.name.clone());
+        Ok((tgt, format!("binary {:?}", tgt.name)))
+    } else if let Some(tgt) = lib_target.filter(|_| bin_targets.is_empty()) {
+        cli.target.lib = true;
+        Ok((tgt, tgt_name_display(tgt)))
+    } else {
+        bail!(
+            "cannot decide which target of package {:?} to analyze, \
+            use --lib, --bin=BIN, --test=TEST or --example=EXAMPLE to select one.",
+            pkg.name,
+        );
+    }
 }
 
 fn get_crate_name_from_artifact(artifact: &Artifact) -> Result<CrateName> {
