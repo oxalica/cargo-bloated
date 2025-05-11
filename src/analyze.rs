@@ -157,8 +157,9 @@ pub fn analyze(
         let demangled_name = rustc_demangle::try_demangle(&raw_name)
             .ok()
             .map(|s| s.to_string());
-        let crate_names = raw_name.starts_with("_R").then_some(()).and_then(|()| {
-            let demangled_name = demangled_name.as_ref()?;
+        // NB. For legacy names from pre-built std, we still tried to search for crates.
+        // Most of them are still also valid item paths.
+        let crate_names = demangled_name.as_deref().and_then(|demangled_name| {
             let mut crates = find_func_crates(demangled_name)?
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -321,7 +322,21 @@ impl CrateCollector {
 
 impl syn::visit::Visit<'_> for CrateCollector {
     fn visit_expr_path(&mut self, i: &'_ syn::ExprPath) {
-        if i.qself.is_none() {
+        // - If `qself` is None, this is a plain path `foo::bar::qux` and `foo` is a crate name.
+        // - If `qself` is Some and position is non-zero, this is a qualified path,
+        //   and the first segment `a` is a crate name.
+        //
+        //   <Vec<T> as a::b::Trait>::AssociatedItem
+        //    ^~~~~~    ~~~~~~~~~~~~~~^
+        //    ty        position = 3
+        //
+        // - If `qself` is Some and position is zero, this is a type associated item,
+        //   and `AssociatedItem` is not a crate name.
+        //
+        //   <Vec<T>>::AssociatedItem
+        //    ^~~~~~   ^
+        //    ty       position = 0
+        if i.qself.as_ref().is_none_or(|qself| qself.position != 0) {
             if let Some(s) = i.path.segments.first() {
                 self.visit_root_name(&s.ident);
             }
@@ -330,7 +345,8 @@ impl syn::visit::Visit<'_> for CrateCollector {
     }
 
     fn visit_type_path(&mut self, i: &'_ syn::TypePath) {
-        if i.qself.is_none() {
+        // See comments above.
+        if i.qself.as_ref().is_none_or(|qself| qself.position != 0) {
             if let Some(s) = i.path.segments.first() {
                 self.visit_root_name(&s.ident);
             }
@@ -464,4 +480,20 @@ pub fn sysroot_crate_names(werr: &mut StatusWriter<'_>) -> Result<Vec<CrateName>
     crate_names[1..len - 1].sort_unstable();
 
     Ok(crate_names)
+}
+
+#[test]
+fn crate_names_from_symbol() {
+    assert_eq!(
+        find_func_crates("<char as os_str_bytes[452d591c1656aa24]::pattern::Pattern>::__encode"),
+        Some(HashSet::from_iter([CrateName(
+            "os_str_bytes[452d591c1656aa24]".into()
+        )])),
+    );
+    assert_eq!(
+        find_func_crates(
+            "<core::num::error::ParseIntError as core::fmt::Debug>::fmt::h59cd647cde20bef5"
+        ),
+        Some(HashSet::from_iter([CrateName("core".into())])),
+    );
 }
