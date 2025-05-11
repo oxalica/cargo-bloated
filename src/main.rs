@@ -4,7 +4,7 @@ use std::collections::hash_map::Entry;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 use std::sync::LazyLock;
 
 use anstream::stream::IsTerminal;
@@ -261,26 +261,8 @@ impl StatusWriter<'_> {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let CargoCli::Bloated(cli) = <CargoCli as clap::Parser>::parse();
-    match main_inner(cli) {
-        Ok(()) => Ok(()),
-        Err(err) => {
-            // Exit without additional message on broken pipe. This is a common
-            // case when piping our output to a `PAGER`.
-            if err
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe)
-            {
-                std::process::exit(1);
-            }
-            Err(err)
-        }
-    }
-}
-
-fn main_inner(mut cli: Cli) -> Result<()> {
-    let cargo_path = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut werr = StatusWriter {
         // Stderr is not performance critical. Do not lock to ease debugging experience.
         werr: &mut anstream::AutoStream::new(std::io::stderr(), cli.color()),
@@ -290,6 +272,27 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             i8::try_from(cli.verbose).unwrap_or(i8::MAX)
         },
     };
+
+    match main_inner(cli, &mut werr) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            // Exit without additional message on broken pipe. This is a common
+            // case when piping our output to a `PAGER`.
+            if err
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|err| err.kind() == std::io::ErrorKind::BrokenPipe)
+            {
+                // Print nothing.
+            } else {
+                werr.error(format_args!("{err:#}"));
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
+    let cargo_path = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
 
     let cargo_meta = {
         let mut cmd = MetadataCommand::new()
@@ -303,14 +306,13 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         werr.with(1, |werr| {
             cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd)
         });
-        let output = cmd.output().context("failed to run `cargo metadata`")?;
-        if !output.status.success() {
-            std::process::exit(output.status.code().unwrap_or(1));
-        }
-
-        let output_str =
-            String::from_utf8(output.stdout).context("output of `cargo metadata` is not UTF-8")?;
-        MetadataCommand::parse(output_str).context("failed to parse output of `cargo metadata`")?
+        (|| {
+            let output = cmd.output()?;
+            output.status.exit_ok()?;
+            let stdout = String::from_utf8(output.stdout)?;
+            anyhow::Ok(MetadataCommand::parse(&stdout)?)
+        })()
+        .with_context(|| format!("failed to run {cmd:?}"))?
     };
 
     // Find the specific package, or auto-select the only or the default package from workspace.
@@ -360,7 +362,9 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         werr.with(1, |werr| {
             cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd)
         });
-        let mut child = cmd.spawn().context("failed to run `cargo build`")?;
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to run {cmd:?}"))?;
 
         let reader = BufReader::new(child.stdout.take().unwrap());
         let mut final_artifact = None;
@@ -410,6 +414,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         }
         let st = child.wait().context("failed to wait `cargo build`")?;
         if !st.success() {
+            // Build failed. Cargo already printed the message, we simply exit.
             std::process::exit(st.code().unwrap_or(1));
         }
         final_artifact.context("artifact is not produced")?
@@ -453,7 +458,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
             "<cyan,bold>   Analyzing</> {target_display}: {exe_path}"
         )
     });
-    let report = analyze::analyze(exe_path, &crate_topo_order, &mut werr)
+    let report = analyze::analyze(exe_path, &crate_topo_order, werr)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 
     // Setup pager for output, if possible.
@@ -747,5 +752,17 @@ impl fmt::Display for ByteSize {
             0
         };
         write!(f, "{y:>4.prec$}{unit}")
+    }
+}
+
+// From feature "exit_status_error": <https://github.com/rust-lang/rust/issues/84908>
+trait ExitStatusExt: Sized {
+    fn exit_ok(self) -> Result<()>;
+}
+impl ExitStatusExt for ExitStatus {
+    fn exit_ok(self) -> Result<()> {
+        self.success()
+            .then_some(())
+            .ok_or_else(|| anyhow::anyhow!("process exited unsuccessfully: {self}"))
     }
 }

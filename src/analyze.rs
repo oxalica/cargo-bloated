@@ -14,7 +14,7 @@ use goblin::{Object, elf::Elf};
 use regex_lite::Regex;
 use tempfile::NamedTempFile;
 
-use crate::StatusWriter;
+use crate::{ExitStatusExt, StatusWriter};
 
 /// Special cases crates that does not appear in dependency graph.
 /// They are not disambiguated.
@@ -115,7 +115,7 @@ pub fn analyze(
     let obj = Object::parse(&bytes).context("failed to parse object")?;
     let elf = match obj {
         Object::Elf(elf) => elf,
-        _ => bail!("TODO: unsupported object type"),
+        _ => bail!("TODO: unsupported object type, only ELF is supported yet"),
     };
 
     ret.unstripped.file_size = bytes.len() as u64;
@@ -124,10 +124,9 @@ pub fn analyze(
     ret.stripped = match analyze_stripped(bin_path, werr) {
         Ok(stripped) => stripped,
         Err(err) => {
-            werr.error(format_args!(
-                "failed to strip, fallback to use unstripped file for calculation. {}",
-                err,
-            ));
+            let err = err
+                .context("failed to strip, fallback to use unstripped file for size calculation");
+            werr.error(format_args!("{err:#}"));
             ret.unstripped.clone()
         }
     };
@@ -258,7 +257,7 @@ pub fn analyze(
 }
 
 fn analyze_stripped(bin_path: &Utf8Path, werr: &mut StatusWriter<'_>) -> Result<SectionReport> {
-    let out_file = NamedTempFile::new().context("failed to create a temp file")?;
+    let out_file = NamedTempFile::new().context("failed to create a temporary file")?;
     let strip_exe = std::env::var("STRIP").unwrap_or_else(|_| "strip".into());
     let mut cmd = Command::new(strip_exe);
     cmd.args(["-s", "-o"])
@@ -269,12 +268,12 @@ fn analyze_stripped(bin_path: &Utf8Path, werr: &mut StatusWriter<'_>) -> Result<
         .stderr(Stdio::inherit());
 
     werr.with(1, |werr| {
-        cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd)
+        cwriteln!(werr, "<green,bold>     Running</> {cmd:?}")
     });
-    let st = cmd.status().context("failed to run strip")?;
-    if !st.success() {
-        bail!("strip exited with {:?}", st.code());
-    }
+    cmd.status()
+        .map_err(Into::into)
+        .and_then(|st| st.exit_ok())
+        .with_context(|| format!("failed to run {cmd:?}"))?;
 
     let mut bytes = Vec::new();
     out_file
