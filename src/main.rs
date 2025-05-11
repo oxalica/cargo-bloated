@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io::{BufReader, Write};
 use std::process::{Child, Command, Stdio};
@@ -18,7 +18,6 @@ use crate::analyze::{CrateName, SYSROOT_CRATES};
 
 mod analyze;
 
-/// Find out what takes most of the space in your binary.
 #[derive(Debug, clap::Parser)]
 #[command(name = "cargo")]
 #[command(bin_name = "cargo")]
@@ -26,55 +25,106 @@ enum CargoCli {
     Bloated(Cli),
 }
 
+/// Find out what takes most of the space in your executable, more accurately.
 #[derive(Debug, clap::Args)]
 struct Cli {
-    #[arg(long, num_args(0..=1), default_value = "primary")]
-    crates_grouping: CrateGrouping,
+    /// Print mangled names without demangling.
     #[arg(long)]
     mangled: bool,
+    /// Include disambiguators for demangled crate names.
     #[arg(long)]
-    disambig: bool,
+    disambiguator: bool,
+    /// Use verbose output.
     #[arg(long, short)]
     verbose: bool,
-    #[arg(long, value_enum, default_value_t)]
+    /// Output format for analysis report.
+    ///
+    /// Output fields for `--output=functions`:
+    /// - `File`  : The function size percentage of the stripped binary.
+    /// - `.text` : The function size percentage of the ".text" sections.
+    /// - `Size`  : The absolute function size.
+    /// - `Crates`: Crates referenced by this symbol. The first one is the earliest instantiator to blame.
+    /// - `Name`  : The demangled (or mangled if `--mangled` is set) symbol name.
+    ///
+    /// Output fields for `--output=crates`:
+    /// - `File`  : The crate size percentage of the stripped binary.
+    /// - `.text` : The crate size percentage of the ".text" sections.
+    /// - `Size`  : The accumulated size of all functions introduced (earliest instantiation) by this crate.
+    /// - `Crate` : The crate name.
+    #[arg(long, value_enum, default_value_t, verbatim_doc_comment)]
     output: OutputMode,
+    /// Do not automatically use `PAGER` to long outputs.
+    /// This option is implied if stdout is not TTY, `PAGER` environment is an
+    /// empty string, or `--output=summary` (the default value).
     #[arg(long)]
     no_pager: bool,
-
+    /// Coloring.
     #[arg(long, default_value_t = clap::ColorChoice::Auto)]
     color: clap::ColorChoice,
 
+    /// (unstable) Change how to decide which crate to blame for a given symbol.
+    #[arg(long, default_value = "primary", hide = true)]
+    crate_grouping: CrateGrouping,
+
     #[command(flatten)]
     target: Target,
+    /// No effect. We already use `release` profile by default.
+    #[arg(long)]
+    release: bool,
+    /// Select a profile other than `release` to analyze.
     #[arg(long, default_value = "release")]
     profile: String,
-    #[arg(long)]
-    ignore_rust_version: bool,
+    /// Package to build
     #[arg(long, short)]
     package: Option<String>,
 
-    #[arg(long)]
-    no_default_features: bool,
-    #[arg(long, conflicts_with = "no_default_features")]
-    all_features: bool,
-    #[arg(long, short = 'F', value_delimiter = ',')]
-    features: Vec<String>,
-    #[arg(long)]
-    locked: bool,
-    #[arg(long)]
-    offline: bool,
-    #[arg(long)]
-    frozen: bool,
+    #[command(flatten)]
+    passthru: PassthruOpts,
+
+    /// Arbitrary additional options to be passed to `cargo build`.
+    #[arg(last = true)]
+    build_args: Vec<OsString>,
+}
+
+#[derive(Debug, clap::Args)]
+struct PassthruOpts {
+    /// Passthru option of `cargo`.
     #[arg(long)]
     manifest_path: Option<Utf8PathBuf>,
+    /// Passthru option of `cargo`.
+    #[arg(long)]
+    lockfile_path: Option<Utf8PathBuf>,
+    /// Passthru option of `cargo`.
+    #[arg(long)]
+    locked: bool,
+    /// Passthru option of `cargo`.
+    #[arg(long)]
+    offline: bool,
+    /// Passthru option of `cargo`.
+    #[arg(long)]
+    frozen: bool,
+    /// Passthru option of `cargo`.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Passthru option of `cargo`.
+    #[arg(long)]
+    all_features: bool,
+    /// Passthru option of `cargo`.
+    #[arg(long, short = 'F', value_delimiter = ',')]
+    features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 enum OutputMode {
+    /// Print a short summary for human, including file size, some top largest
+    /// ELF sections and functions.
     #[default]
     Summary,
+    /// Print file size and ELF sections sorted by reversed size.
     Sections,
+    /// Print functions sorted by reversed size.
     Functions,
+    /// Print crates size estimation sorted by reversed size.
     Crates,
 }
 
@@ -144,29 +194,32 @@ impl Cli {
             panic!("target not set");
         }
 
-        cmd.arg("--profile")
-            .arg(&self.profile)
-            .args(self.ignore_rust_version.then_some("--ignore-rust-version"));
+        cmd.arg("--profile").arg(&self.profile);
 
         if let Some(pkg) = &self.package {
             cmd.arg("--package").arg(pkg);
         }
 
         self.extend_cargo_metadata_args(cmd);
+        cmd.args(&self.build_args);
     }
 
     fn extend_cargo_metadata_args(&self, cmd: &mut Command) {
         cmd.arg("--color")
             .arg(self.color.to_string())
-            .args(self.no_default_features.then_some("--no-default-features"))
-            .args(self.all_features.then_some("--all-features"))
-            .args(self.locked.then_some("--locked"))
-            .args(self.offline.then_some("--offline"))
-            .args(self.frozen.then_some("--frozen"));
-        if !self.features.is_empty() {
-            cmd.arg("--features").arg(self.features.join(","));
+            .args(
+                self.passthru
+                    .no_default_features
+                    .then_some("--no-default-features"),
+            )
+            .args(self.passthru.all_features.then_some("--all-features"))
+            .args(self.passthru.locked.then_some("--locked"))
+            .args(self.passthru.offline.then_some("--offline"))
+            .args(self.passthru.frozen.then_some("--frozen"));
+        if !self.passthru.features.is_empty() {
+            cmd.arg("--features").arg(self.passthru.features.join(","));
         }
-        if let Some(path) = &self.manifest_path {
+        if let Some(path) = &self.passthru.manifest_path {
             cmd.arg("--manifest-path").arg(path);
         }
     }
@@ -442,7 +495,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
         let mut crate_tally = <HashMap<&CrateName, u64>>::new();
         for func in &report.funcs {
             let sym = &func.symbols[0];
-            match cli.crates_grouping {
+            match cli.crate_grouping {
                 CrateGrouping::Primary => {
                     let name = sym.primary_crate().unwrap_or(&unknown_crate);
                     *crate_tally.entry(name).or_default() += func.size;
@@ -473,7 +526,7 @@ fn main_inner(mut cli: Cli) -> Result<()> {
                 perc(size, stripped_size),
                 perc(size, report.text_size),
                 ByteSize(size),
-                name.display(cli.disambig),
+                name.display(cli.disambiguator),
             )?;
         }
         writeln!(w)?;
@@ -492,15 +545,15 @@ fn main_inner(mut cli: Cli) -> Result<()> {
                 perc(func.size, stripped_size),
                 perc(func.size, report.text_size),
                 ByteSize(func.size),
-                func.symbols[0].display_crates(cli.disambig),
-                func.symbols[0].display_name(cli.mangled, cli.disambig),
+                func.symbols[0].display_crates(cli.disambiguator),
+                func.symbols[0].display_name(cli.mangled, cli.disambiguator),
             )?;
             for sym in &func.symbols[1..] {
                 cwriteln!(
                     w,
                     "<dim>                       {:32} {}</>",
-                    sym.display_crates(cli.disambig),
-                    sym.display_name(cli.mangled, cli.disambig),
+                    sym.display_crates(cli.disambiguator),
+                    sym.display_name(cli.mangled, cli.disambiguator),
                 )?;
             }
         }
@@ -580,6 +633,7 @@ fn detect_spawn_pager() -> Option<Child> {
     try_spawn(&["more".as_ref()])
 }
 
+// Byte size display, but with number and unit aligned.
 struct ByteSize(u64);
 
 impl fmt::Display for ByteSize {
