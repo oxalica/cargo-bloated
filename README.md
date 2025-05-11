@@ -1,13 +1,33 @@
 # cargo-bloated
 
-Find out what takes most of the space in your executable.
+[![github](https://img.shields.io/crates/v/cargo-bloated)](https://crates.io/crates/cargo-bloated)
+[![crates.io](https://img.shields.io/crates/v/cargo-bloated)](https://crates.io/crates/cargo-bloated)
+
+Find out what takes most of the space in your executable, more accurately.
 
 A more bloated but feature-rich reimplementation of
 [cargo-bloat](https://github.com/RazrFalcon/cargo-bloat)
 optimized for my personal use.
 Use more dependencies rather than reinventing wheels.
 
-Notable features/differences:
+## Install
+
+```bash
+cargo install cargo-bloated
+```
+
+## Usage
+
+```console
+$ cargo bloated # Analyze the default target of default package, and print a summary.
+$ cargo bloated --output crates # Per-crate sizes, blaming the earliest instantiating crate.
+$ cargo bloated --output sections # ELF section sizes.
+$ cargo bloated --output functions # Details of each function symbol.
+```
+
+Run `cargo bloated --help` to see all arguments available.
+
+## Comparing to cargo-bloat
 
 - Currently only Linux/ELF is supported, because I have no Windows machine.
 
@@ -47,3 +67,20 @@ Notable features/differences:
   A heuristic algorithm is performed to decide which crate is to blame.
   Do not blame the crate for using a generic function already instantiated in
   their dependency, eg. `drop_in_place::<String>` and `drop_in_place::<MyStringWrapper>`.
+
+<br>
+
+#### License
+
+<sup>
+Licensed under either of <a href="LICENSE-APACHE">Apache License, Version
+2.0</a> or <a href="LICENSE-MIT">MIT license</a> at your option.
+</sup>
+
+<br>
+
+<sub>
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this crate by you, as defined in the Apache-2.0 license, shall
+be dual licensed as above, without any additional terms or conditions.
+</sub>
