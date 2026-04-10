@@ -26,6 +26,43 @@ $ cargo bloated --output functions # Details of each function symbol.
 
 Run `cargo bloated --help` to see all arguments available.
 
+Sample output:
+
+```console
+$ cargo bloated
+   Compiling testy v0.1.0 (/tmp/testy)
+    Finished `release` profile [optimized] target(s) in 1.00s
+   Analyzing binary "testy": /tmp/testy/target/release/testy
+   File   Size Section
+100.0% 1470KiB (file)
+143.6% 2.06MiB (unstripped)
+ 52.2%  768KiB .text
+ 21.8%  320KiB .rodata
+  8.6%  126KiB .eh_frame
+  5.9% 86.8KiB .gcc_except_table
+
+  File  .text    Size  Crate
+ 64.3% 123.1%  945KiB  *
+ 11.8%  22.6%  173KiB  cyper
+ 11.5%  22.1%  169KiB  idna
+  6.3%  12.1% 92.6KiB  hyper
+  5.8%  11.1% 85.3KiB  http
+  3.4%   6.5% 50.0KiB  compio_net
+  3.2%   6.1% 46.9KiB  encoding_rs
+  3.1%   6.0% 45.7KiB  url
+  2.7%   5.1% 39.4KiB  compio_driver
+
+  File    Size  .text  .rodata   (SHR) .data.rel.ro   (SHR) Crates                           Name
+  9.3%  136KiB  173  B  136KiB    0  B       376  B    0  B idna                             idna::domain_to_ascii_from_cow
+  1.2% 17.0KiB 16.5KiB  209  B 21.1KiB       264  B   32  B cyper,hyper_util                 <hyper_util::client::legacy::client::Client<cyper::connector::Connector, cyper::body::Body>>::send_request::{closure#0}
+  0.8% 11.2KiB 10.6KiB  596  B    0  B         0  B    0  B http                             <http::header::name::StandardHeader>::from_bytes
+  0.7% 10.7KiB 10.1KiB  230  B 19.3KiB       352  B   32  B testy,compio_runtime,scoped_tls  <scoped_tls::ScopedKey<compio_runtime::runtime::Runtime>>::set::<<compio_runtime::runtime::Runtime>::block_on<testy::main::{closure#0}>::{closure#0}, ()>
+  0.7% 10.4KiB 1281  B 2.59KiB 21.1KiB      6.53KiB  160  B encoding_rs                      <encoding_rs::Encoding>::for_label
+  0.7% 10.1KiB 9.72KiB   24  B 19.4KiB       384  B   32  B hyper                            <hyper::proto::h1::role::Client as hyper::proto::h1::Http1Transaction>::parse
+  0.6% 9.12KiB 8.91KiB    0  B 20.5KiB       216  B    0  B idna                             <idna::uts46::Uts46>::process_innermost
+  0.6% 8.49KiB 8.07KiB  185  B 20.7KiB       240  B   72  B cyper,core,send_wrapper          <send_wrapper::SendWrapper<<cyper::stream::HttpStream>::connect::{closure#0}> as core::future::future::Future>::poll
+```
+
 ## Comparing to cargo-bloat
 
 - Supports rough `.rodata` and `.data.rel.ro` usage tracking by parsing ELF and linker map.
