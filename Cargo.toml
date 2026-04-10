@@ -1,6 +1,6 @@
 [package]
 name = "cargo-bloated"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Find out what takes most of the space in your executable, more accurately"
 repository = "https://github.com/oxalica/cargo-bloated"
