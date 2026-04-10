@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::process::{Child, Command, ExitCode, ExitStatus, Stdio};
 
 use anstream::stream::IsTerminal;
@@ -13,10 +13,17 @@ use cargo_metadata::{Message, MetadataCommand, TargetKind};
 use clap::ArgAction;
 use color_print::cwriteln;
 use itertools::Itertools;
+use tempfile::NamedTempFile;
 
-use crate::analyze::{CrateName, get_crate_name_from_artifact, sysroot_crate_names};
+use crate::analyze::{
+    CrateName, get_crate_name_from_artifact, sysroot_crate_names, sysroot_lib_path,
+};
+use crate::linker_map::LinkerMapResult;
+
+const LINKER_SENTINEL_VAR: &str = "CARGOBLOATED_AS_LINKER";
 
 mod analyze;
+mod linker_map;
 
 #[derive(Debug, clap::Parser)]
 #[command(name = "cargo")]
@@ -264,6 +271,16 @@ impl StatusWriter<'_> {
 }
 
 fn main() -> ExitCode {
+    if let Some(output_path) = std::env::var_os(LINKER_SENTINEL_VAR) {
+        return match linker_map::main_as_linker(&output_path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("cargo-bloated: {err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let CargoCli::Bloated(cli) = <CargoCli as clap::Parser>::parse();
     let mut werr = StatusWriter {
         // Stderr is not performance critical. Do not lock to ease debugging experience.
@@ -343,7 +360,9 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
 
     let (target, target_display) = select_pkg_target(&mut cli, pkg)?;
 
-    let mut crate_topo_order = sysroot_crate_names(werr)
+    let sysroot_lib_path = sysroot_lib_path()?;
+
+    let mut crate_topo_order = sysroot_crate_names(werr, &sysroot_lib_path)
         .context("failed to search std's dependencies")?
         .into_iter()
         .enumerate()
@@ -351,7 +370,15 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
         .flat_map(|(idx, name)| [(name.without_disambig(), idx), (name, idx)])
         .collect::<HashMap<CrateName, usize>>();
 
-    let artifact = {
+    let (artifact, linker_map) = {
+        let result_output_file =
+            NamedTempFile::new().context("failed to create a temporary file")?;
+        let current_exe_path = Utf8PathBuf::from_path_buf(
+            std::env::current_exe().expect("cannot get current exe path"),
+        )
+        .ok()
+        .context("current exe path is not in UTF-8")?;
+
         let mut enc_rustflags = if let Some(s) = std::env::var_os("CARGO_ENCODED_RUSTFLAGS") {
             s.into_string()
                 .ok()
@@ -369,16 +396,31 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
         }
         enc_rustflags.push_str("-Cprefer-dynamic\x1F-Csymbol-mangling-version=v0");
 
+        let rand = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .context("invalid system time")?
+            .as_nanos()
+            % 65537;
+
         let mut cmd = Command::new(&cargo_path);
         let profile_env = cli.profile.to_uppercase();
-        cmd.args(["build", "--message-format=json-render-diagnostics"])
-            .env("CARGO_ENCODED_RUSTFLAGS", enc_rustflags)
-            .env(format!("CARGO_PROFILE_{profile_env}_STRIP",), "false")
-            .env(format!("CARGO_PROFILE_{profile_env}_LTO"), "false")
-            .stdin(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .stdout(Stdio::piped());
+        cmd.args(["rustc", "--message-format=json-render-diagnostics"]);
         cli.extend_cargo_build_args(&mut cmd);
+        cmd.args([
+            "--",
+            &format!("-Clinker={current_exe_path}"),
+            "-Clinker-flavor=gcc",
+            "-Clink-arg=-fuse-ld=lld",
+            // Add a random argument to bypass cache. This will be filtered by the hooked linker.
+            &format!("-Clink-arg={LINKER_SENTINEL_VAR}={rand}"),
+        ])
+        .env(LINKER_SENTINEL_VAR, result_output_file.path())
+        .env("CARGO_ENCODED_RUSTFLAGS", enc_rustflags)
+        .env(format!("CARGO_PROFILE_{profile_env}_STRIP",), "false")
+        .env(format!("CARGO_PROFILE_{profile_env}_LTO"), "false")
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped());
         werr.with(1, |werr| {
             cwriteln!(werr, "<green,bold>     Running</> {:?}", &cmd)
         });
@@ -432,8 +474,20 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
             // Build failed. Cargo already printed the message, we simply exit.
             std::process::exit(st.code().unwrap_or(1));
         }
-        final_artifact.context("artifact is not produced")?
+        let artifact = final_artifact.context("artifact is not produced")?;
+
+        let mut buf = String::new();
+        (&result_output_file)
+            .read_to_string(&mut buf)
+            .context("failed to read hooked linker output")?;
+        let linker_map = miniserde::json::from_str::<LinkerMapResult>(&buf)
+            .context("failed to parse hooked linker output")?;
+        (artifact, linker_map)
     };
+
+    for err in &linker_map.warnings {
+        werr.warn(err);
+    }
 
     if werr.verbosity >= 1 {
         let mut ordered_crates = crate_topo_order.iter().collect::<Vec<_>>();
@@ -467,7 +521,7 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
             "<cyan,bold>   Analyzing</> {target_display}: {exe_path}"
         )
     });
-    let report = analyze::analyze(exe_path, &crate_topo_order, werr)
+    let report = analyze::analyze(werr, exe_path, &crate_topo_order, &linker_map)
         .with_context(|| format!("failed to analyze file: {exe_path}"))?;
 
     // Setup pager for output, if possible.
@@ -565,15 +619,19 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
     if let Some(max_len) = show_functions {
         cwriteln!(
             w,
-            "<underline,bold>  File  .text    Size  Crates                           Name</>"
+            "<underline,bold>  File    Size  .text  .rodata   (SHR) .data.rel.ro   (SHR) Crates                           Name</>"
         )?;
         for func in report.funcs.iter().take(max_len) {
             writeln!(
                 w,
-                "{:>5.1}% {:>5.1}% {}  {:32} {}",
+                "{:>5.1}% {} {} {} {}      {} {} {:32} {}",
                 perc(func.size, stripped_size),
-                perc(func.size, report.text_size),
                 ByteSize(func.size),
+                ByteSize(func.text_size),
+                ByteSize(func.data_usage.rodata_owned),
+                ByteSize(func.data_usage.rodata_shared),
+                ByteSize(func.data_usage.relro_owned),
+                ByteSize(func.data_usage.relro_shared),
                 func.symbols[0].display_crates(cli.disambiguator),
                 func.symbols[0].display_name(cli.mangled, cli.disambiguator),
             )?;

@@ -8,13 +8,16 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use cargo_metadata::camino::Utf8Path;
+use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use color_print::cwriteln;
 use goblin::{Object, elf::Elf};
 use regex_lite::Regex;
 use tempfile::NamedTempFile;
 
-use crate::{ExitStatusExt, StatusWriter};
+use crate::{
+    ExitStatusExt, StatusWriter,
+    linker_map::{DataUsage, LinkerMapResult},
+};
 
 #[derive(Debug, Default)]
 pub struct Report {
@@ -34,6 +37,8 @@ pub struct SectionReport {
 pub struct Func {
     pub symbols: Vec<Symbol>,
     pub size: u64,
+    pub text_size: u64,
+    pub data_usage: DataUsage,
 }
 
 #[derive(Debug)]
@@ -102,9 +107,10 @@ fn analyze_sections(elf: &Elf<'_>) -> Vec<(String, u64)> {
 }
 
 pub fn analyze(
+    werr: &mut StatusWriter<'_>,
     bin_path: &Utf8Path,
     crate_topo_order: &HashMap<CrateName, usize>,
-    werr: &mut StatusWriter<'_>,
+    linker_map: &LinkerMapResult,
 ) -> Result<Report> {
     let mut ret = Report::default();
 
@@ -189,9 +195,16 @@ pub fn analyze(
 
         let idx = *addr_to_func_idx.entry(sym.st_value).or_insert_with(|| {
             let idx = ret.funcs.len();
+            let data_usage = linker_map
+                .func_data_map
+                .get(&raw_name)
+                .cloned()
+                .unwrap_or_default();
             ret.funcs.push(Func {
                 symbols: Vec::new(),
-                size: sym.st_size,
+                size: sym.st_size + data_usage.rodata_owned + data_usage.relro_owned,
+                text_size: sym.st_size,
+                data_usage,
             });
             idx
         });
@@ -410,7 +423,7 @@ pub fn get_crate_name_from_artifact(artifact: &cargo_metadata::Artifact) -> Resu
     bail!("cannot find disambiguator from rlib");
 }
 
-pub fn sysroot_crate_names(werr: &mut StatusWriter<'_>) -> Result<Vec<CrateName>> {
+pub fn sysroot_lib_path() -> Result<Utf8PathBuf> {
     fn run_cmd(args: &[&str]) -> Result<String> {
         let mut cmd = Command::new(args[0]);
         cmd.args(&args[1..])
@@ -431,8 +444,13 @@ pub fn sysroot_crate_names(werr: &mut StatusWriter<'_>) -> Result<Vec<CrateName>
     let rustc_path = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let host_target = run_cmd(&[&rustc_path, "--print=host-tuple"])?;
     let sysroot = run_cmd(&[&rustc_path, "--print=sysroot"])?;
-    let sysroot_lib_path = Utf8Path::new(&sysroot).join(format!("lib/rustlib/{host_target}/lib"));
+    Ok(Utf8Path::new(&sysroot).join(format!("lib/rustlib/{host_target}/lib")))
+}
 
+pub fn sysroot_crate_names(
+    werr: &mut StatusWriter<'_>,
+    sysroot_lib_path: &Utf8Path,
+) -> Result<Vec<CrateName>> {
     let std_dylib_path = sysroot_lib_path
         .read_dir_utf8()
         .ok()

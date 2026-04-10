@@ -28,6 +28,10 @@ Run `cargo bloated --help` to see all arguments available.
 
 ## Comparing to cargo-bloat
 
+- Supports rough `.rodata` and `.data.rel.ro` usage tracking by parsing ELF and linker map.
+  This requires bundled `ld.lld` from Rust toolchain, but should work
+  out-of-box on latest stable rustc.
+
 - Currently only Linux/ELF is supported, because I have no Windows machine.
 
 - Proper CLI parsing via `clap` for least surprise, eg. correct multiple
