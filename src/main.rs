@@ -274,6 +274,7 @@ fn main() -> ExitCode {
     if let Some(output_path) = std::env::var_os(LINKER_SENTINEL_VAR) {
         return match linker_map::main_as_linker(&output_path) {
             Ok(()) => ExitCode::SUCCESS,
+            #[expect(clippy::print_stderr)]
             Err(err) => {
                 eprintln!("cargo-bloated: {err}");
                 ExitCode::FAILURE
@@ -354,7 +355,7 @@ fn main_inner(mut cli: Cli, werr: &mut StatusWriter<'_>) -> Result<()> {
         let default_pkg = default_pkg
             .context("multiple packages are available, use `--package=NAME` to select one")?;
         let pkg = &cargo_meta[default_pkg];
-        cli.package = Some(pkg.name.clone());
+        cli.package = Some(pkg.name.as_ref().into());
         pkg
     };
 
@@ -748,20 +749,20 @@ fn detect_spawn_pager() -> Option<Child> {
     }
 
     // Prefer `less` for custom options.
-    if let Ok(less_path) = which::which_global("less") {
-        if let Some(child) = try_spawn(&[
+    if let Ok(less_path) = which::which_global("less")
+        && let Some(child) = try_spawn(&[
             less_path.as_ref(),
             "--chop-long-lines".as_ref(),
             "--RAW-CONTROL-CHARS".as_ref(),
-        ]) {
-            return Some(child);
-        }
+        ])
+    {
+        return Some(child);
     }
 
-    if let Some(pager) = pager {
-        if let Some(child) = try_spawn(&["/bin/sh".as_ref(), "-c".as_ref(), pager.as_ref()]) {
-            return Some(child);
-        }
+    if let Some(pager) = pager
+        && let Some(child) = try_spawn(&["/bin/sh".as_ref(), "-c".as_ref(), pager.as_ref()])
+    {
+        return Some(child);
     }
     try_spawn(&["more".as_ref()])
 }

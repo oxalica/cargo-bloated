@@ -349,20 +349,20 @@ impl syn::visit::Visit<'_> for CrateCollector {
         //   <Vec<T>>::AssociatedItem
         //    ^~~~~~   ^
         //    ty       position = 0
-        if i.qself.as_ref().is_none_or(|qself| qself.position != 0) {
-            if let Some(s) = i.path.segments.first() {
-                self.visit_root_name(&s.ident);
-            }
+        if i.qself.as_ref().is_none_or(|qself| qself.position != 0)
+            && let Some(s) = i.path.segments.first()
+        {
+            self.visit_root_name(&s.ident);
         }
         syn::visit::visit_expr_path(self, i);
     }
 
     fn visit_type_path(&mut self, i: &'_ syn::TypePath) {
         // See comments above.
-        if i.qself.as_ref().is_none_or(|qself| qself.position != 0) {
-            if let Some(s) = i.path.segments.first() {
-                self.visit_root_name(&s.ident);
-            }
+        if i.qself.as_ref().is_none_or(|qself| qself.position != 0)
+            && let Some(s) = i.path.segments.first()
+        {
+            self.visit_root_name(&s.ident);
         }
         syn::visit::visit_type_path(self, i);
     }
